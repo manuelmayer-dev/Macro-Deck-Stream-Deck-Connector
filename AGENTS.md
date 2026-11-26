@@ -29,6 +29,8 @@ src/StreamDeckConnector/
   PluginIntegration.cs   the integration: lifecycle and capability opt-ins
   LogMessageAction.cs    the example action, localized end to end
   Localization/Strings.resx   default-culture strings; Strings.<tag>.resx per language
+  Devices/               Stream Deck USB transport: model catalogue, protocols, device, manager, diagnostics
+  Hid/                   HID seam (IHidConnection, IHidDeviceSource); HidSharp types live only in HidSharpDeviceSource
   Assets/icon.svg        the icon the manifest declares
   Properties/launchSettings.json   the single real-host debug profile
 tests/StreamDeckConnector.Tests/
