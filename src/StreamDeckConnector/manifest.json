@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schemas.macro-deck.app/plugin-manifest-v1.schema.json",
+  "manifestVersion": 1,
+  "id": "com.manuelmayer.streamdeck-connector",
+  "name": "Stream Deck Connector",
+  "version": "1.0.0",
+  "description": "Use an Elgato Stream Deck as a Macro Deck input device.",
+  "icon": "Assets/icon.svg",
+  "entrypoints": {
+    "win-x64": {
+      "executable": "runtimes/win-x64/StreamDeckConnector.dll",
+      "runtime": {
+        "kind": "FrameworkDependent",
+        "dotnetVersion": "10.0"
+      }
+    },
+    "osx-arm64": {
+      "executable": "runtimes/osx-arm64/StreamDeckConnector.dll",
+      "runtime": {
+        "kind": "FrameworkDependent",
+        "dotnetVersion": "10.0"
+      }
+    },
+    "linux-x64": {
+      "executable": "runtimes/linux-x64/StreamDeckConnector.dll",
+      "runtime": {
+        "kind": "FrameworkDependent",
+        "dotnetVersion": "10.0"
+      }
+    }
+  },
+  "publisher": {
+    "name": "manuelmayer-dev"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/manuelmayer-dev/MacroDeckStreamDeckPlugin",
+  "compatibility": {
+    "macroDeck": ">=3.0.0-0"
+  }
+}
