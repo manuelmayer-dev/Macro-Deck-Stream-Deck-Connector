@@ -180,7 +180,7 @@ public sealed class LayoutTests
 
 		var format = StreamDeckLayouts.KeyImageFormat(mini)!;
 
-		Assert.That((format.Encoding, format.Rotation), Is.EqualTo((KeyImageEncodings.Bmp, 90)));
+		Assert.That((format.Encoding, format.Rotation, format.MirrorHorizontal), Is.EqualTo((KeyImageEncodings.Bmp, 270, true)));
 	}
 }
 

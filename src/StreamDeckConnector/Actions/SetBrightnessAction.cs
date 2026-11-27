@@ -52,19 +52,19 @@ public sealed class SetBrightnessAction : IActionDefinition
 					Strings.Actions.SetBrightness.InvalidBrightness());
 			}
 
-			var devices = _manager.Devices.Where(device => device.Model.HasKeyImages).ToList();
-			if (devices.Count == 0)
-			{
-				return ActionResult.Failed(ActionErrorCodes.NotConnected, Strings.Actions.SetBrightness.NoDevice());
-			}
-
+			int applied;
 			try
 			{
-				await Task.WhenAll(devices.Select(device => device.SetBrightnessAsync(percent, context.CancellationToken))).ConfigureAwait(false);
+				applied = await _manager.SetBrightnessAsync(percent, context.CancellationToken).ConfigureAwait(false);
 			}
 			catch (Exception ex) when (ex is IOException or ObjectDisposedException or InvalidOperationException)
 			{
 				return ActionResult.Failed(ActionErrorCodes.ProviderError, Strings.Actions.SetBrightness.Failed());
+			}
+
+			if (applied == 0)
+			{
+				return ActionResult.Failed(ActionErrorCodes.NotConnected, Strings.Actions.SetBrightness.NoDevice());
 			}
 
 			return ActionResult.Success();

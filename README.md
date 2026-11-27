@@ -74,7 +74,7 @@ note on the integration page while an untested model is connected. If yours misb
 | Corsair Galleon K100 SD (the 12 display keys only) | 12 | No |
 
 A Stream Deck that is not in this list is never opened. Macro Deck shows it as an issue on the
-integration page with a link to report it.
+integration page with a link to report it. Other Elgato products are ignored.
 
 ## Actions
 
@@ -89,7 +89,7 @@ integration page with a link to report it.
 
 **The device does not appear.** Close the Elgato Stream Deck software. On Linux, add the udev rule
 above and replug. The integration page in Macro Deck shows an issue when the device is attached but
-cannot be opened.
+cannot be opened, and the plugin tries again every few seconds.
 
 **Pictures are rotated, mirrored or garbled, or keys are mapped to the wrong position.** This can
 happen on a model that was never tested. Please report it.
