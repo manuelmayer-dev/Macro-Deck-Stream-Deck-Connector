@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <!-- The default-language file. Every translation is checked against it and the fallback chain ends
+       here, so it is required even for a plugin that ships one language. Add a language by adding
+       Localization/Strings.<culture>.resx beside it (Strings.de.resx, Strings.pt-BR.resx).
+       A dotted key becomes a nested class: Issues.HostTooOld.Title is Strings.Issues.HostTooOld.Title(). -->
+  <resheader name="resmimetype">
+    <value>text/microsoft-resx</value>
+  </resheader>
+  <resheader name="version">
+    <value>2.0</value>
+  </resheader>
+  <resheader name="reader">
+    <value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <resheader name="writer">
+    <value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <data name="Actions.SetBrightness.Name" xml:space="preserve">
+    <value>Set Stream Deck brightness</value>
+  </data>
+  <data name="Actions.SetBrightness.Description" xml:space="preserve">
+    <value>Sets the display brightness of every connected Stream Deck.</value>
+  </data>
+  <data name="Actions.SetBrightness.Brightness.Label" xml:space="preserve">
+    <value>Brightness</value>
+  </data>
+  <data name="Actions.SetBrightness.Brightness.Description" xml:space="preserve">
+    <value>Brightness in percent, from 0 to 100.</value>
+  </data>
+  <data name="Actions.SetBrightness.InvalidBrightness" xml:space="preserve">
+    <value>The brightness must be a number from 0 to 100.</value>
+  </data>
+  <data name="Actions.SetBrightness.NoDevice" xml:space="preserve">
+    <value>No Stream Deck with displays is connected.</value>
+  </data>
+  <data name="Actions.SetBrightness.Failed" xml:space="preserve">
+    <value>The Stream Deck did not accept the brightness.</value>
+  </data>
+  <data name="Actions.WriteDiagnostics.Name" xml:space="preserve">
+    <value>Write Stream Deck diagnostics to the log</value>
+  </data>
+  <data name="Actions.WriteDiagnostics.Description" xml:space="preserve">
+    <value>Writes a snapshot of every Stream Deck this plugin sees to the Macro Deck log. Attach it when you report a problem. Serial numbers are masked.</value>
+  </data>
+  <data name="Actions.WriteDiagnostics.Trace.Label" xml:space="preserve">
+    <value>Trace raw USB reports</value>
+  </data>
+  <data name="Actions.WriteDiagnostics.Trace.Description" xml:space="preserve">
+    <value>Keeps logging raw USB reports until this action runs again with the option off. Key pictures are never logged, only their size.</value>
+  </data>
+  <data name="Issues.WriteDiagnostics" xml:space="preserve">
+    <value>Write diagnostics to the log</value>
+  </data>
+  <data name="Issues.DiagnosticsWritten" xml:space="preserve">
+    <value>The diagnostics are in the Macro Deck log. Please attach them to your issue.</value>
+  </data>
+  <data name="Issues.NothingToDo" xml:space="preserve">
+    <value>There is nothing this plugin can do about this issue on its own.</value>
+  </data>
+  <data name="Issues.HidUnavailable.Title" xml:space="preserve">
+    <value>USB access is not available</value>
+  </data>
+  <data name="Issues.HidUnavailable.Description" xml:space="preserve">
+    <value>The plugin cannot look for Stream Decks: {error}</value>
+  </data>
+  <data name="Issues.HostTooOld.Title" xml:space="preserve">
+    <value>This Macro Deck version cannot draw Stream Deck keys</value>
+  </data>
+  <data name="Issues.HostTooOld.Description" xml:space="preserve">
+    <value>The Stream Deck is connected and its keys work, but the displays stay dark because this Macro Deck version does not render key images. Update Macro Deck.</value>
+  </data>
+  <data name="Issues.OpenFailed.Title" xml:space="preserve">
+    <value>{model} could not be opened</value>
+  </data>
+  <data name="Issues.OpenFailed.Description" xml:space="preserve">
+    <value>The device is attached but the plugin cannot open it: {error}. On Linux this usually means the udev rule from the plugin's README is missing. Another program that holds the device can also cause it.</value>
+  </data>
+  <data name="Issues.Unsupported.Title" xml:space="preserve">
+    <value>Unsupported Stream Deck</value>
+  </data>
+  <data name="Issues.Unsupported.Description" xml:space="preserve">
+    <value>{product} (vendor {vendorId}, product {productId}) is not supported yet and is ignored. Please open an issue for it and attach the diagnostics from the log.</value>
+  </data>
+  <data name="Issues.Untested.Title" xml:space="preserve">
+    <value>{model} is untested</value>
+  </data>
+  <data name="Issues.Untested.Description" xml:space="preserve">
+    <value>This model is supported from its protocol documentation only and was never tested on real hardware. If something does not work, please open an issue and attach the diagnostics from the log.</value>
+  </data>
+</root>
