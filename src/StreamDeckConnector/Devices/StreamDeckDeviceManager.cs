@@ -24,7 +24,7 @@ public sealed class StreamDeckDeviceManager : IAsyncDisposable
 	private readonly Dictionary<string, StreamDeckDevice> _devicesByPath = [];
 	private readonly Dictionary<string, DeviceRecord> _records = [];
 	private readonly Dictionary<string, UnsupportedDevice> _unsupportedByPath = [];
-	private readonly HashSet<string> _openFailing = [];
+	private readonly Dictionary<string, OpenFailure> _openFailing = [];
 	private bool _started;
 	private bool _disposed;
 
@@ -59,6 +59,18 @@ public sealed class StreamDeckDeviceManager : IAsyncDisposable
 			lock (_stateLock)
 			{
 				return [.. _unsupportedByPath.Values];
+			}
+		}
+	}
+
+	/// <summary>Supported devices that are attached but could not be opened.</summary>
+	public IReadOnlyList<OpenFailure> OpenFailures
+	{
+		get
+		{
+			lock (_stateLock)
+			{
+				return [.. _openFailing.Values];
 			}
 		}
 	}
@@ -116,7 +128,10 @@ public sealed class StreamDeckDeviceManager : IAsyncDisposable
 
 			lock (_stateLock)
 			{
-				_openFailing.IntersectWith(paths);
+				foreach (var gone in _openFailing.Keys.Where(path => !paths.Contains(path)).ToList())
+				{
+					_openFailing.Remove(gone);
+				}
 			}
 
 			await CloseMissingAsync(present).ConfigureAwait(false);
@@ -312,7 +327,7 @@ public sealed class StreamDeckDeviceManager : IAsyncDisposable
 				bool firstOfEpisode;
 				lock (_stateLock)
 				{
-					firstOfEpisode = _openFailing.Add(info.Path);
+					firstOfEpisode = _openFailing.TryAdd(info.Path, new OpenFailure(model.Name, record.SerialTail, ex.Message));
 					record.LastError = $"open failure: {ex.Message}";
 				}
 

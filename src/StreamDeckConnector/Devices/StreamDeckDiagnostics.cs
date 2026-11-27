@@ -7,6 +7,7 @@ namespace StreamDeckConnector.Devices;
 public static class StreamDeckSupport
 {
 	public const string IssuesUrl = "https://github.com/manuelmayer-dev/MacroDeckStreamDeckPlugin/issues";
+	public const string ReadmeUrl = "https://github.com/manuelmayer-dev/MacroDeckStreamDeckPlugin#troubleshooting";
 }
 
 /// <summary>Switched at runtime by the integration. The raw trace is off by default.</summary>
@@ -83,7 +84,7 @@ public sealed class DeviceCounters
 }
 
 /// <summary>
-/// Opt-in hex trace at Debug. Capped in bytes per line and lines per second so it cannot flood the log.
+/// Opt-in hex trace, logged at Information so it shows without changing the log level. Capped in bytes per line and lines per second so it cannot flood the log.
 /// Image payloads are never dumped, only their length and hash.
 /// </summary>
 public sealed class RawTrace
@@ -113,7 +114,7 @@ public sealed class RawTrace
 			return;
 		}
 
-		_logger.Debug("Raw trace {Direction:l}, {Length} bytes: {Hex:l}{Suppressed:l}", direction, bytes.Length, Hex(bytes), SuppressedNote(suppressed));
+		_logger.Information("Raw trace {Direction:l}, {Length} bytes: {Hex:l}{Suppressed:l}", direction, bytes.Length, Hex(bytes), SuppressedNote(suppressed));
 	}
 
 	/// <param name="header">The header bytes of the first report. The picture bytes behind it are not traced.</param>
@@ -124,7 +125,7 @@ public sealed class RawTrace
 			return;
 		}
 
-		_logger.Debug(
+		_logger.Information(
 			"Raw trace image for key {Key}, {Length} bytes in {Reports} reports, sha256 {Hash:l}, first header: {Hex:l}{Suppressed:l}",
 			key,
 			length,
@@ -176,3 +177,5 @@ public sealed record UnsupportedDevice(string Key, int VendorId, int ProductId, 
 {
 	public static string KeyFor(string path) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(path)))[..12];
 }
+
+public sealed record OpenFailure(string ModelName, string SerialTail, string Error);

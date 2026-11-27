@@ -270,7 +270,7 @@ public sealed class DiagnosticsTests
 			trace.Report("input", report);
 		}
 
-		var lines = sink.Messages(LogEventLevel.Debug);
+		var lines = TraceLines(sink);
 		Assert.That(lines, Has.Count.EqualTo(2));
 		Assert.That(lines[0], Does.Contain("input, 6 bytes: 01 02 03 04 ..."));
 		Assert.That(lines[0], Does.Not.Contain("05"));
@@ -278,7 +278,7 @@ public sealed class DiagnosticsTests
 		time.Advance(TimeSpan.FromSeconds(1));
 		trace.Report("input", report);
 
-		lines = sink.Messages(LogEventLevel.Debug);
+		lines = TraceLines(sink);
 		Assert.That(lines, Has.Count.EqualTo(3));
 		Assert.That(lines[2], Does.Contain("3 earlier trace lines dropped"));
 	}
@@ -293,7 +293,7 @@ public sealed class DiagnosticsTests
 
 		trace.Image(3, 1500, 2, hash, [0x02, 0x07, 0x03, 0x00, 0xF8, 0x03, 0x00, 0x00]);
 
-		var line = sink.Messages(LogEventLevel.Debug).Single();
+		var line = TraceLines(sink).Single();
 		Assert.That(line, Does.Contain("key 3, 1500 bytes in 2 reports"));
 		Assert.That(line, Does.Contain("AABBCCDDEEFF1122"));
 		Assert.That(line, Does.Contain("02 07 03 00 F8 03 00 00"));
@@ -309,7 +309,7 @@ public sealed class DiagnosticsTests
 		await using var device = new StreamDeckDevice(model, "SERIAL", connection, new FakeTimeProvider(), logger, options);
 		await device.SetBrightnessAsync(5);
 
-		Assert.That(sink.Messages(LogEventLevel.Debug), Is.Empty);
+		Assert.That(TraceLines(sink), Is.Empty);
 
 		options.TraceRawReports = true;
 		device.SetKeyImage(0, new byte[2000]);
@@ -322,7 +322,7 @@ public sealed class DiagnosticsTests
 		connection.EnqueueInput(press);
 		await keys.WaitForAsync(1);
 
-		var lines = sink.Messages(LogEventLevel.Debug);
+		var lines = TraceLines(sink);
 		Assert.That(lines.Any(l => l.Contains("image for key 0, 2000 bytes", StringComparison.Ordinal)), Is.True);
 		Assert.That(lines.Any(l => l.StartsWith("Raw trace feature", StringComparison.Ordinal)), Is.True);
 		Assert.That(lines.Any(l => l.StartsWith("Raw trace input, 512 bytes: 01 00 00 00 01", StringComparison.Ordinal)), Is.True);
@@ -344,4 +344,7 @@ public sealed class DiagnosticsTests
 		Assert.That(writes[1].Kind, Is.EqualTo(WriteKind.SetFeature));
 		Assert.That(writes[1].Bytes, Is.EqualTo((byte[])[0x03, 0x27]));
 	}
+
+	private static List<string> TraceLines(CollectingSink sink) =>
+		[.. sink.Messages(LogEventLevel.Information).Where(m => m.StartsWith("Raw trace", StringComparison.Ordinal))];
 }
