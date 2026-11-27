@@ -3,91 +3,59 @@
 This file must be kept up to date. When a rule here stops matching reality, or a new rule emerges from
 work in this repository, update this file as part of that change rather than leaving it to drift.
 
-This repository is the **starting point for a Macro Deck 3 out-of-process plugin**, and it is
-simultaneously the content of the `dotnet new macrodeck-plugin` template package. The plugin under
-`src/StreamDeckConnector/` is deliberately minimal: one integration and one example action,
-`LogMessageAction`, which exists solely to show the localized shape of an action end to end. It is
-meant to be replaced by the plugin's real first action, not grown into a second sample. Nothing else
-is demonstrated here.
+This repository is the **Stream Deck Connector**, a Macro Deck 3 out-of-process plugin that offers
+every attached Elgato Stream Deck to Macro Deck as a device. Macro Deck renders the keys (host-rendered
+key images); the plugin is a transport and contains no renderer and no image library.
 
-Worked examples of every capability live in the
-[sample plugins repository](https://github.com/Macro-Deck-App/Macro-Deck-Sample-Plugins), not here.
-Read from there rather than growing this template.
-
-[README.md](README.md) is the human-facing guide: how to build, how to run against a real host, how to
-pack. This file is the rule set for writing the plugin. Read it before changing code. The template
-package itself is covered by
-[packaging/README.md](https://github.com/Macro-Deck-App/Macro-Deck-Plugin-Template/blob/main/packaging/README.md).
+[README.md](README.md) is the human-facing guide. This file is the rule set for writing the plugin.
+Read it before changing code.
 
 ## Orientation
 
 ```
 src/StreamDeckConnector/
-  Program.cs             builder chain - a few lines and a RunAsync
-  manifest.json          identity, icon, per-platform entrypoints
-  macrodeck-build.json   one publish target per declared entrypoint
-  PluginIntegration.cs   the integration: lifecycle and capability opt-ins
-  LogMessageAction.cs    the example action, localized end to end
-  Localization/Strings.resx   default-culture strings; Strings.<tag>.resx per language
-  Devices/               Stream Deck USB transport: model catalogue, protocols, device, manager, diagnostics
-  Hid/                   HID seam (IHidConnection, IHidDeviceSource); HidSharp types live only in HidSharpDeviceSource
-  Assets/icon.svg        the icon the manifest declares
-  Properties/launchSettings.json   the single real-host debug profile
+  Program.cs                      builder chain, registers the transport services
+  ServiceCollectionExtensions.cs  DI registrations; tests replace IHidDeviceSource
+  manifest.json                   identity, icon, permissions, per-platform entrypoints
+  macrodeck-build.json            one publish target per declared entrypoint
+  PluginIntegration.cs            layout provider, device provider, issue provider, actions
+  StreamDeckLayouts.cs            one fixed layout per catalogue model
+  DeviceBridge.cs                 joins one physical device to its host session
+  Actions/                        Set brightness, Write diagnostics
+  Devices/                        USB transport: model catalogue, protocols, device, manager, diagnostics
+  Hid/                            HID seam (IHidConnection, IHidDeviceSource); HidSharp types live only in HidSharpDeviceSource
+  Localization/Strings.resx       default-culture strings; Strings.<tag>.resx per language
+  Assets/icon.svg                 the icon the manifest declares
 tests/StreamDeckConnector.Tests/
-  PluginIntegrationTests.cs   the plugin builds, the action runs, the catalog is wired
+  PluginIntegrationTests.cs       layouts, sessions, presses, issues, actions
+  Devices/                        transport, protocol and diagnostics tests with a fake HID source
 ```
 
-The template repository carries two more directories that a generated plugin does not:
-`.template.config/` (the `dotnet new` definition) and `packaging/` (the template package project, kept
-out of the solution on purpose).
+Rules specific to this plugin:
 
-`.template.config/content/` holds the *only* deliberate copies in this repository: conditional variants
-of `manifest.json` and `macrodeck-build.json`. `dotnet new` selects platforms and omits unsupplied
-optional fields with `//#if` markers, which would make the checked-in files invalid JSON and break
-`macrodeck-plugin validate`, `build` and the manifest reader. So the files under `src/` stay valid and
-the templated variants replace them during generation. **Change one, change the other**: rendering the
-template with default parameters must reproduce the `src/` files byte for byte, which CI checks.
+- The plugin never draws. A key picture comes from `IDeviceSession.GetKeyImageAsync` or
+  `KeyImageChanged`, in the encoding and orientation the model's layout asked for, and goes to the
+  hardware unchanged. Do not add an image library.
+- Only the Stream Deck MK.2 is verified on hardware (`StreamDeckModel.VerifiedOnHardware`). Set that
+  flag for another model only after someone confirmed it on a real device.
+- A user of untested hardware must be able to report a problem without tooling. Keep the
+  diagnostics snapshot, the raw trace and the integration issues working, and keep serial numbers
+  masked (`SerialMask`) in every log line and snapshot.
+- Every log line or issue about an unsupported or failing device names the repository's issue page.
+- New third-party packages need the owner's explicit approval. HidSharp 2.6.4 is the only one.
+- `THIRD-PARTY-NOTICES` is generated from the published output; regenerate it after a dependency
+  change instead of editing it.
+- Until the Macro Deck SDK with key images is published, build with
+  `-p:MacroDeckSdkVersion=<local version>` against `local-feed/` (see README). Before a Store
+  submission the `local` NuGet source must be gone and the SDK and CLI versions pinned to that
+  release.
 
 Authoritative upstream documentation, in the
 [Macro Deck 3 repository](https://github.com/Macro-Deck-App/Macro-Deck-3/tree/main/docs/plugin-development):
 `sdk-reference.md` (every contract type), `plugin-hosting.md` (builder, registration modes, manifest,
 artifact, environment variables), `capability-parity.md` (what behaves differently out of process),
 `analyzers.md`, `conformance.md`, `testing-plugins.md`, `cli.md`. When a question is about SDK behaviour
-rather than this template's own code, look there rather than guessing.
-
-## Before you start on a fresh plugin
-
-`dotnet new macrodeck-plugin` sets the identity and the publication metadata for you:
-
-```bash
-dotnet new macrodeck-plugin -n <Name> --pluginId <id> --pluginName "<Display name>" \
-  --publisher "<Publisher>" --repository <url> --platforms win-x64 --platforms osx-arm64
-```
-
-`--publisher`, `--description`, `--license`, `--repository`, `--homepage` and `--platforms` all land in
-`manifest.json` natively, and `--platforms` drives `macrodeck-build.json` with it. `--homepage` is
-omitted rather than written empty when not supplied, because the schema requires an absolute URL.
-`--repository` is always written and defaults to a placeholder the Store refuses, so pass the real
-one. `macrodeck-plugin new` collects the same values and passes them through.
-
-A repository *cloned* from this template still carries the template's identity, so fix that first, in
-one change:
-
-1. `manifest.json` - `id` (reverse-domain, lowercase, at least two dot-joined kebab segments, e.g.
-   `com.example.my-plugin`), `name`, `version`, `description`, `publisher.name`, `repository`, and
-   `entrypoints` plus the matching `macrodeck-build.json` targets for the platforms you actually ship.
-2. Rename the project, the test project, the solution file and the namespace. The project's
-   `AssemblyName` and `RootNamespace` are pinned: the first names the executable, so change it together
-   with the `entrypoints` paths - never one without the other, or `macrodeck-plugin build` fails with
-   `entrypoint-missing`; the second is where the generated `Strings` class lives.
-3. Replace `Assets/icon.svg`. The manifest's `icon` path is the single source of truth and the host
-   reads that file directly - there is no icon code to change.
-4. Replace `LogMessageAction` with the plugin's real first action, and its keys in
-   `Localization/Strings.resx` with real ones.
-
-`MacroDeck.Plugin.Analyzers` is already referenced with `PrivateAssets="all"` - 13 compile-time
-diagnostics that catch most of the mistakes below while you type, plus the `[MacroDeckSdkUsage]`
-attribute the host reads to report real deprecation usage instead of inferring it. Keep it.
+rather than this plugin's own code, look there rather than guessing.
 
 ## Store gate
 
@@ -269,9 +237,9 @@ capture a default before the config read finishes.
 - Check `MacroDeckStrings` before adding a key - `Common.*`, `Validation.*`, `Connection.*`,
   `Settings.*` are already translated everywhere Macro Deck ships. A duplicated `Save` is one more string
   every translator keeps in sync for text the reader already sees. Compose instead:
-  `MacroDeckStrings.Validation.Required(Strings.Actions.LogMessage.Message.Label())`.
+  `MacroDeckStrings.Validation.Required(Strings.Actions.SetBrightness.Brightness.Label())`.
 - **Keys are dotted, not underscored.** A dotted key becomes a nested class, so
-  `Actions.LogMessage.Message.Label` is `Strings.Actions.LogMessage.Message.Label()`. Name a key after
+  `Actions.SetBrightness.Brightness.Label` is `Strings.Actions.SetBrightness.Brightness.Label()`. Name a key after
   where it is used, not after the English wording. A key that is also a group other keys nest under is
   MDLOC008.
 - Placeholders are named (`{host}`) and become method parameters, so a missing one is a compile error.
@@ -371,15 +339,9 @@ it after any change to capability shape, cancellation handling or the manifest, 
 check going from pass to fail as a blocking regression. Most checks `SKIP` until the plugin declares
 capabilities.
 
-The Macro Deck packages float to the newest published version, so the commands above need no version
-argument. Only to test against SDK surface that is not published yet, pack it into `local-feed/` and
-pass `-p:MacroDeckSdkVersion=<version>` - see "Building against a local SDK build" in
-[README.md](README.md).
-
-Working in the template repository itself rather than in a plugin generated from it? Changing its shape
-(files, names, `.template.config/template.json`, `packaging/`) also needs a generated-project check -
-see
-[packaging/README.md](https://github.com/Macro-Deck-App/Macro-Deck-Plugin-Template/blob/main/packaging/README.md).
+While the SDK with key images is unpublished, every command above needs
+`-p:MacroDeckSdkVersion=<local version>` (or that name as an environment variable for the CLI), with the
+SDK packed into `local-feed/` - see "Development" in [README.md](README.md).
 
 ## Packing a plugin release
 
@@ -412,9 +374,6 @@ match.
 
 - Work on a branch, not directly on `main`. Use `feature/`, `fix/`, `refactor/`, `chore/`, `docs/` or
   `ci/` with a short kebab-case description, and an issue number where one exists.
-- Publishing the template package requires a pushed semantic-version tag such as
-  `v3.0.0-preview.3`. The publish workflow removes the leading `v` and uses the rest as the NuGet
-  package version. A push to `main` alone never publishes.
 - Keep changes focused; no unrelated reformatting.
 - Do not push or open a pull request unless asked.
 - Do not add AI attribution or co-author trailers.
