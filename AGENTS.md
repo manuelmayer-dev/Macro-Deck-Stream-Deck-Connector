@@ -19,8 +19,9 @@ src/StreamDeckConnector/
   manifest.json                   identity, icon, permissions, per-platform entrypoints
   macrodeck-build.json            one publish target per declared entrypoint
   PluginIntegration.cs            layout provider, device provider, issue provider, actions
-  StreamDeckLayouts.cs            one fixed layout per catalogue model
+  StreamDeckLayouts.cs            the fixed layout of each catalogue model; only attached models are registered
   DeviceBridge.cs                 joins one physical device to its host session
+  HostCalls.cs                    repeats a host call the host refused for its call limit
   Actions/                        Set brightness, Write diagnostics
   Devices/                        USB transport: model catalogue, protocols, device, manager, diagnostics
   Hid/                            HID seam (IHidConnection, IHidDeviceSource); HidSharp types live only in HidSharpDeviceSource
@@ -42,6 +43,9 @@ Rules specific to this plugin:
   diagnostics snapshot, the raw trace and the integration issues working, and keep serial numbers
   masked (`SerialMask`) in every log line and snapshot.
 - Every log line or issue about an unsupported or failing device names the repository's issue page.
+- Macro Deck limits how many calls a plugin makes in a burst (20, then 10 per second, shared by
+  everything the plugin calls). Keep start-up and the per-press path frugal, send host calls that must
+  not be lost through `HostCalls.RetryAsync`, and never fetch what Macro Deck pushes anyway.
 - New third-party packages need the owner's explicit approval. HidSharp 2.6.4 is the only one.
 - `THIRD-PARTY-NOTICES` is generated from the published output; regenerate it after a dependency
   change instead of editing it.
