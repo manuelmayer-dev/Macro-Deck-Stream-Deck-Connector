@@ -7,7 +7,8 @@ namespace StreamDeckConnector.Devices;
 /// <summary>
 /// One opened Stream Deck. A dedicated reader raises key events straight from input reports and never
 /// waits behind writes. One writer owns every output and feature report, so reports of different keys
-/// never interleave. Pictures arrive already encoded for the model.
+/// never interleave. Pictures arrive already encoded for the model. Nothing touches the connection
+/// until <see cref="Start"/>, so handlers can be attached first without racing the device threads.
 /// </summary>
 public sealed class StreamDeckDevice : IAsyncDisposable
 {
@@ -15,23 +16,23 @@ public sealed class StreamDeckDevice : IAsyncDisposable
 	private static readonly TimeSpan _stopTimeout = TimeSpan.FromSeconds(2);
 	private static readonly TimeSpan _keepAliveInterval = TimeSpan.FromMilliseconds(500);
 
-	// Marks a key that was blanked by a feature report. Never equals a SHA-256 hash.
-	private static readonly byte[] _blankMarker = [];
-
 	private readonly IStreamDeckProtocol _protocol;
 	private readonly IHidConnection _connection;
 	private readonly TimeProvider _timeProvider;
 	private readonly ByteRateLimiter? _rateLimiter;
 	private readonly ILogger _logger;
 	private readonly RawTrace _trace;
-	private readonly ITimer? _keepAliveTimer;
 	private readonly CancellationTokenSource _stop = new();
 	private readonly SemaphoreSlim _signal = new(0);
 	private readonly object _gate = new();
 	private readonly List<WorkItem> _queue = [];
 	private readonly byte[]?[] _shownKeys;
-	private readonly Task _reader;
-	private readonly Task _writer;
+	private ITimer? _keepAliveTimer;
+	private Task _reader = Task.CompletedTask;
+	private Task _writer = Task.CompletedTask;
+	private Exception? _endReason;
+	private bool _featureFailureLogged;
+	private int _started;
 	private int _ended;
 	private int _disposed;
 
@@ -65,15 +66,6 @@ public sealed class StreamDeckDevice : IAsyncDisposable
 			// Bursts of a few reports pass unthrottled, the long run is held to the model's rate.
 			_rateLimiter = new ByteRateLimiter(timeProvider, model.BytesPerSecond, Math.Max(_protocol.OutputReportLength * 2, model.BytesPerSecond / 20));
 		}
-
-		if (model.SendsKeepAlive && !_protocol.KeepAliveReport.IsEmpty)
-		{
-			_keepAliveTimer = timeProvider.CreateTimer(_ => EnqueueKeepAlive(), null, _keepAliveInterval, _keepAliveInterval);
-		}
-
-		// The reader gets its own thread because a blocking read would otherwise pin a pool thread forever.
-		_reader = Task.Factory.StartNew(ReadLoop, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
-		_writer = Task.Run(WriteLoopAsync);
 	}
 
 	public StreamDeckModel Model { get; }
@@ -90,8 +82,49 @@ public sealed class StreamDeckDevice : IAsyncDisposable
 	/// <summary>Raised on the reader thread with the logical key index.</summary>
 	public event Action<int>? KeyUp;
 
-	/// <summary>Raised exactly once, on a device thread, when a read or write fails. Not raised by disposal.</summary>
+	/// <summary>
+	/// Raised exactly once, on a device thread, when the read loop or an image or reset write fails. Not
+	/// raised by disposal, and not by a refused brightness, logo or keep-alive report.
+	/// </summary>
 	public event Action<Exception>? Disconnected;
+
+	/// <summary>
+	/// Reads the serial feature report straight from a connection that no device owns yet. Throws when
+	/// every candidate request fails or the answer is empty.
+	/// </summary>
+	public static string ReadSerialNumber(StreamDeckModel model, IHidConnection connection)
+	{
+		ArgumentNullException.ThrowIfNull(model);
+		ArgumentNullException.ThrowIfNull(connection);
+		var protocol = StreamDeckProtocols.Create(model);
+		var serial = ReadFeatureText(connection, protocol.SerialRequests, protocol.ParseSerialNumber).Trim();
+		return serial.Length > 0 ? serial : throw new IOException("The serial feature report is empty.");
+	}
+
+	/// <summary>Starts the reader, the writer and the keep-alive. Work queued before is sent first.</summary>
+	public void Start()
+	{
+		if (Interlocked.Exchange(ref _started, 1) != 0)
+		{
+			return;
+		}
+
+		lock (_gate)
+		{
+			if (Volatile.Read(ref _ended) != 0)
+			{
+				return;
+			}
+
+			// The reader gets its own thread because a blocking read would otherwise pin a pool thread forever.
+			_reader = Task.Factory.StartNew(ReadLoop, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+			_writer = Task.Run(WriteLoopAsync);
+			if (Model.SendsKeepAlive && !_protocol.KeepAliveReport.IsEmpty)
+			{
+				_keepAliveTimer = _timeProvider.CreateTimer(_ => EnqueueKeepAlive(), null, _keepAliveInterval, _keepAliveInterval);
+			}
+		}
+	}
 
 	/// <summary>
 	/// Queues an encoded picture for a key. A newer picture for the same key replaces one that was not
@@ -106,19 +139,10 @@ public sealed class StreamDeckDevice : IAsyncDisposable
 		Enqueue(new WorkItem(WorkKind.KeyImage, key) { Data = encoded.ToArray() });
 	}
 
-	/// <summary>Blanks a key without an image. Throws <see cref="NotSupportedException"/> on protocols without that command.</summary>
-	public void ClearKey(int key)
-	{
-		RequireDisplay();
-		StreamDeckProtocols.CheckKey(key, Model.KeyCount);
-		if (!_protocol.SupportsClearKey)
-		{
-			throw new NotSupportedException($"{Model.Name} cannot blank a key without an image.");
-		}
-
-		Enqueue(new WorkItem(WorkKind.KeyClear, key));
-	}
-
+	/// <summary>
+	/// Completes once the report was sent. Faults with the HID error when the device refused it (the device
+	/// stays open) and with <see cref="InvalidOperationException"/> when the device ended first.
+	/// </summary>
 	public Task SetBrightnessAsync(int percent, CancellationToken cancellationToken = default)
 	{
 		RequireDisplay();
@@ -127,18 +151,15 @@ public sealed class StreamDeckDevice : IAsyncDisposable
 		return EnqueueAsync(new WorkItem(WorkKind.Brightness, -1) { Percent = percent }, cancellationToken);
 	}
 
-	/// <summary>Shows the built-in logo. Afterwards no key is assumed to show anything.</summary>
+	/// <summary>Shows the built-in logo. Afterwards no key is assumed to show anything. Fails like <see cref="SetBrightnessAsync"/>.</summary>
 	public Task ShowLogoAsync(CancellationToken cancellationToken = default)
 	{
 		RequireDisplay();
 		return EnqueueAsync(new WorkItem(WorkKind.ShowLogo, -1), cancellationToken);
 	}
 
-	public Task<string> GetFirmwareVersionAsync(CancellationToken cancellationToken = default) =>
-		EnqueueTextAsync(new WorkItem(WorkKind.FirmwareVersion, -1), cancellationToken);
-
-	public Task<string> GetSerialNumberAsync(CancellationToken cancellationToken = default) =>
-		EnqueueTextAsync(new WorkItem(WorkKind.SerialNumber, -1), cancellationToken);
+	public async Task<string> GetFirmwareVersionAsync(CancellationToken cancellationToken = default) =>
+		await EnqueueAsync(new WorkItem(WorkKind.FirmwareVersion, -1), cancellationToken).ConfigureAwait(false) ?? string.Empty;
 
 	public async ValueTask DisposeAsync()
 	{
@@ -148,9 +169,17 @@ public sealed class StreamDeckDevice : IAsyncDisposable
 		}
 
 		End(null);
+		Task reader;
+		Task writer;
+		lock (_gate)
+		{
+			reader = _reader;
+			writer = _writer;
+		}
+
 		try
 		{
-			await Task.WhenAll(_reader, _writer).WaitAsync(_stopTimeout, _timeProvider).ConfigureAwait(false);
+			await Task.WhenAll(reader, writer).WaitAsync(_stopTimeout, _timeProvider).ConfigureAwait(false);
 		}
 		catch (TimeoutException)
 		{
@@ -201,10 +230,11 @@ public sealed class StreamDeckDevice : IAsyncDisposable
 				}
 			}
 		}
-		catch (OperationCanceledException) when (token.IsCancellationRequested)
+		catch (Exception) when (token.IsCancellationRequested)
 		{
+			// Ended or disposed: a read interrupted by closing the connection is not a failure of its own.
 		}
-		catch (Exception ex)
+		catch (Exception ex) when (!Failures.IsFatal(ex))
 		{
 			End(ex, "read");
 		}
@@ -226,6 +256,7 @@ public sealed class StreamDeckDevice : IAsyncDisposable
 	{
 		var token = _stop.Token;
 		var outputBuffer = new byte[_protocol.OutputReportLength];
+		WorkItem? current = null;
 		try
 		{
 			if (Model.HasKeyImages && !_protocol.ResetKeyStreamReport.IsEmpty)
@@ -238,20 +269,27 @@ public sealed class StreamDeckDevice : IAsyncDisposable
 			while (true)
 			{
 				await _signal.WaitAsync(token).ConfigureAwait(false);
-				var item = TakeNext();
-				if (item is not null)
+				current = TakeNext();
+				if (current is not null)
 				{
-					await ExecuteAsync(item, outputBuffer, token).ConfigureAwait(false);
+					await ExecuteAsync(current, outputBuffer, token).ConfigureAwait(false);
+					current = null;
 				}
 			}
 		}
-		catch (OperationCanceledException) when (token.IsCancellationRequested)
+		catch (Exception) when (token.IsCancellationRequested)
 		{
+			// Ended or disposed: whatever the closed connection threw is not a failure of its own.
 		}
-		catch (Exception ex)
+		catch (Exception ex) when (!Failures.IsFatal(ex))
 		{
 			Counters.WriteFailed();
 			End(ex, "write");
+		}
+		finally
+		{
+			// End only fails what is still queued. The item in hand was already taken off the queue.
+			current?.Fail(Volatile.Read(ref _endReason) ?? new InvalidOperationException("The device is disconnected."));
 		}
 	}
 
@@ -268,47 +306,35 @@ public sealed class StreamDeckDevice : IAsyncDisposable
 			case WorkKind.KeyImage:
 				await SendKeyImageAsync(item.Key, item.Data!, outputBuffer, token).ConfigureAwait(false);
 				break;
-			case WorkKind.KeyClear:
-				if (!ReferenceEquals(_shownKeys[item.Key], _blankMarker))
-				{
-					var clear = new byte[_protocol.FeatureReportLength];
-					_protocol.BuildClearKeyReport(item.Key, clear);
-					await ThrottleAsync(clear.Length, token).ConfigureAwait(false);
-					_trace.Report("feature", clear);
-					_connection.SetFeatureReport(clear);
-					_shownKeys[item.Key] = _blankMarker;
-				}
-
-				break;
 			case WorkKind.Brightness:
 				var brightness = new byte[_protocol.FeatureReportLength];
 				_protocol.BuildBrightnessReport(item.Percent, brightness);
-				await ThrottleAsync(brightness.Length, token).ConfigureAwait(false);
-				_trace.Report("feature", brightness);
-				_connection.SetFeatureReport(brightness);
+				if (!await TrySendFeatureAsync(item, brightness, token).ConfigureAwait(false))
+				{
+					return;
+				}
+
 				break;
 			case WorkKind.ShowLogo:
 				var logo = new byte[_protocol.FeatureReportLength];
 				_protocol.BuildShowLogoReport(logo);
-				await ThrottleAsync(logo.Length, token).ConfigureAwait(false);
-				_trace.Report("feature", logo);
-				_connection.SetFeatureReport(logo);
+				// Cleared even when refused: the keys may show anything now, so every picture is sent again.
 				Array.Clear(_shownKeys);
+				if (!await TrySendFeatureAsync(item, logo, token).ConfigureAwait(false))
+				{
+					return;
+				}
+
 				break;
 			case WorkKind.KeepAlive:
-				await ThrottleAsync(_protocol.KeepAliveReport.Length, token).ConfigureAwait(false);
-				_trace.Report("feature", _protocol.KeepAliveReport.Span);
-				_connection.SetFeatureReport(_protocol.KeepAliveReport.Span);
-				break;
-			case WorkKind.SerialNumber:
+				await TrySendFeatureAsync(item, _protocol.KeepAliveReport, token).ConfigureAwait(false);
+				return;
 			case WorkKind.FirmwareVersion:
 				try
 				{
-					text = item.Kind == WorkKind.SerialNumber
-						? ReadFeatureText(_protocol.SerialRequests, _protocol.ParseSerialNumber)
-						: ReadFeatureText(_protocol.FirmwareRequests, _protocol.ParseFirmwareVersion);
+					text = ReadFeatureText(_connection, _protocol.FirmwareRequests, _protocol.ParseFirmwareVersion);
 				}
-				catch (IOException ex)
+				catch (Exception ex) when (!token.IsCancellationRequested && !Failures.IsFatal(ex))
 				{
 					item.Fail(ex);
 					return;
@@ -318,6 +344,44 @@ public sealed class StreamDeckDevice : IAsyncDisposable
 		}
 
 		item.Complete(text);
+	}
+
+	// A refused feature report fails its command but leaves the device open. A device that is really gone
+	// is noticed by the reader, whose blocking read fails, and by the source's change notification.
+	private async Task<bool> TrySendFeatureAsync(WorkItem item, ReadOnlyMemory<byte> report, CancellationToken token)
+	{
+		await ThrottleAsync(report.Length, token).ConfigureAwait(false);
+		_trace.Report("feature", report.Span);
+		try
+		{
+			_connection.SetFeatureReport(report.Span);
+		}
+		catch (Exception ex) when (!token.IsCancellationRequested && !Failures.IsFatal(ex))
+		{
+			Counters.WriteFailed();
+			Counters.SetLastError($"{item.Kind} feature report refused: {ex.Message}");
+			// The keep-alive repeats every 500 ms, so only the first refusal of a run is a warning.
+			if (_featureFailureLogged)
+			{
+				_logger.Debug("Stream Deck {Model:l} refused the {Command} feature report: {Error:l}", Model.Name, item.Kind, ex.Message);
+			}
+			else
+			{
+				_featureFailureLogged = true;
+				_logger.Warning(
+					"Stream Deck {Model:l} refused the {Command} feature report: {Error:l}. The device stays open. If this keeps happening, please open an issue at "
+					+ StreamDeckSupport.IssuesUrl + " and attach the diagnostics snapshot.",
+					Model.Name,
+					item.Kind,
+					ex.Message);
+			}
+
+			item.Fail(ex);
+			return false;
+		}
+
+		_featureFailureLogged = false;
+		return true;
 	}
 
 	private async Task SendKeyImageAsync(int key, byte[] image, byte[] outputBuffer, CancellationToken token)
@@ -348,19 +412,19 @@ public sealed class StreamDeckDevice : IAsyncDisposable
 	}
 
 	// A failed read is not fatal here: families disagree on report ids and lengths, so candidates are tried in turn.
-	private string ReadFeatureText(IReadOnlyList<FeatureRequest> requests, TextParser parse)
+	private static string ReadFeatureText(IHidConnection connection, IReadOnlyList<FeatureRequest> requests, TextParser parse)
 	{
-		IOException? last = null;
+		Exception? last = null;
 		foreach (var request in requests)
 		{
 			var buffer = new byte[request.Length];
 			buffer[0] = request.ReportId;
 			try
 			{
-				_connection.GetFeatureReport(buffer);
+				connection.GetFeatureReport(buffer);
 				return parse(buffer);
 			}
-			catch (IOException ex)
+			catch (Exception ex) when (!Failures.IsFatal(ex))
 			{
 				last = ex;
 			}
@@ -387,10 +451,10 @@ public sealed class StreamDeckDevice : IAsyncDisposable
 				return;
 			}
 
-			if (item.Kind is WorkKind.KeyImage or WorkKind.KeyClear)
+			if (item.Kind == WorkKind.KeyImage)
 			{
 				// Latest wins, and it also takes the latest place so it cannot jump ahead of a later logo or brightness.
-				_queue.RemoveAll(queued => queued.Kind is WorkKind.KeyImage or WorkKind.KeyClear && queued.Key == item.Key);
+				_queue.RemoveAll(queued => queued.Kind == WorkKind.KeyImage && queued.Key == item.Key);
 			}
 
 			_queue.Add(item);
@@ -422,9 +486,6 @@ public sealed class StreamDeckDevice : IAsyncDisposable
 		Signal();
 		return done.Task;
 	}
-
-	private async Task<string> EnqueueTextAsync(WorkItem item, CancellationToken cancellationToken) =>
-		await EnqueueAsync(item, cancellationToken).ConfigureAwait(false) ?? string.Empty;
 
 	private void EnqueueKeepAlive()
 	{
@@ -468,7 +529,7 @@ public sealed class StreamDeckDevice : IAsyncDisposable
 		}
 	}
 
-	// The first caller wins: it closes the connection, releases waiters and, for a failure, raises Disconnected.
+	// The first caller wins: it closes the connection, fails queued commands and, for a failure, raises Disconnected.
 	private void End(Exception? failure, string operation = "")
 	{
 		if (Interlocked.Exchange(ref _ended, 1) != 0)
@@ -476,11 +537,22 @@ public sealed class StreamDeckDevice : IAsyncDisposable
 			return;
 		}
 
-		_keepAliveTimer?.Dispose();
+		var reason = failure ?? new InvalidOperationException("The device was disposed.");
+		Volatile.Write(ref _endReason, reason);
+		lock (_gate)
+		{
+			_keepAliveTimer?.Dispose();
+		}
+
 		if (failure is not null)
 		{
 			Counters.SetLastError($"{operation} failure: {failure.Message}");
-			_logger.Warning("Stream Deck {Model:l} ended after a {Operation:l} failure: {Error:l}", Model.Name, operation, failure.Message);
+			_logger.Warning(
+				"Stream Deck {Model:l} ended after a {Operation:l} failure: {Error:l}. If it was not unplugged, please open an issue at "
+				+ StreamDeckSupport.IssuesUrl + " and attach the diagnostics snapshot.",
+				Model.Name,
+				operation,
+				failure.Message);
 		}
 
 		_stop.Cancel();
@@ -493,7 +565,6 @@ public sealed class StreamDeckDevice : IAsyncDisposable
 			_queue.Clear();
 		}
 
-		var reason = failure ?? new InvalidOperationException("The device was disposed.");
 		foreach (var item in abandoned)
 		{
 			item.Fail(reason);
@@ -517,11 +588,9 @@ public sealed class StreamDeckDevice : IAsyncDisposable
 	private enum WorkKind
 	{
 		KeyImage,
-		KeyClear,
 		Brightness,
 		ShowLogo,
 		KeepAlive,
-		SerialNumber,
 		FirmwareVersion,
 	}
 

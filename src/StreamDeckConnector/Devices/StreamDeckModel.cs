@@ -21,8 +21,8 @@ public enum StreamDeckProtocolFamily
 /// <param name="VerifiedOnHardware">Whether the model was exercised on real hardware by the maintainers. Everything else is built from the protocol sources only.</param>
 /// <param name="SendsKeepAlive">Whether the device needs a periodic feature report to stay awake (Galleon K100 SD).</param>
 /// <param name="KeyPixelSize">Edge length of the square key image in pixels, 0 when the model has no key displays.</param>
-/// <param name="RotationDegrees">Clockwise rotation the hardware expects the picture to have before encoding.</param>
-/// <param name="MirrorHorizontal">Whether the picture must be mirrored left to right before encoding.</param>
+/// <param name="RotationDegrees">Clockwise rotation the hardware expects, applied after <paramref name="MirrorHorizontal"/>, as the Macro Deck host does.</param>
+/// <param name="MirrorHorizontal">Whether the picture is mirrored left to right before it is rotated. A BMP picture is then stored as a standard bottom-up file.</param>
 /// <param name="BytesPerSecond">Recommended sustained output rate, 0 when nothing is ever sent.</param>
 public sealed record StreamDeckModel(
 	string Name,

@@ -79,9 +79,6 @@ public sealed class ProtocolTests
 
 		protocol.BuildShowLogoReport(report);
 		Assert.That(report, Is.EqualTo(Padded(32, 0x03, 0x02)));
-
-		protocol.BuildClearKeyReport(9, report);
-		Assert.That(report, Is.EqualTo(Padded(32, 0x03, 0x06, 9, 0, 0, 0)));
 	}
 
 	[Test]
@@ -222,7 +219,6 @@ public sealed class ProtocolTests
 		protocol.BuildShowLogoReport(report);
 		Assert.That(report, Is.EqualTo(Padded(17, 0x0B, 0x63)));
 
-		Assert.That(protocol.SupportsClearKey, Is.False);
 		Assert.That(protocol.ResetKeyStreamReport.IsEmpty, Is.True);
 	}
 
@@ -280,7 +276,6 @@ public sealed class ProtocolTests
 
 		protocol.BuildShowLogoReport(report);
 		Assert.That(report, Is.EqualTo(Padded(17, 0x0B, 0x63)));
-		Assert.That(protocol.SupportsClearKey, Is.False);
 	}
 
 	[Test]
@@ -296,5 +291,24 @@ public sealed class ProtocolTests
 		Assert.That(StreamDeckModels.All.Select(m => m.ProductId), Is.Unique);
 		Assert.That(StreamDeckModels.TryGet(0x0FD9, 0x00AA, out _), Is.False, "Studio is not supported");
 		Assert.That(StreamDeckModels.TryGet(0x0FD9, 0x2B18, out _), Is.False, "the Galleon is keyed by the Corsair vendor id");
+	}
+
+	[Test]
+	public void The_bitmap_models_ask_for_the_orientation_python_elgato_streamdeck_produces()
+	{
+		// Host order: mirror left to right, then turn clockwise, then a standard bottom-up BMP.
+		Assert.That((Model(0x0060).RotationDegrees, Model(0x0060).MirrorHorizontal), Is.EqualTo((180, false)), "both axes flipped");
+		foreach (var mini in new[] { 0x0063, 0x0090, 0x00B3, 0x00B8 })
+		{
+			Assert.That((Model(mini).RotationDegrees, Model(mini).MirrorHorizontal), Is.EqualTo((270, true)), $"0x{mini:X4} is transposed");
+		}
+	}
+
+	[Test]
+	public void The_minimum_input_report_carries_every_key_state()
+	{
+		Assert.That(StreamDeckProtocols.Create(Model(0x0080)).MinimumInputReportLength, Is.EqualTo(4 + 15));
+		Assert.That(StreamDeckProtocols.Create(Model(0x0060)).MinimumInputReportLength, Is.EqualTo(1 + 15));
+		Assert.That(StreamDeckProtocols.Create(Model(0x0063)).MinimumInputReportLength, Is.EqualTo(1 + 6));
 	}
 }

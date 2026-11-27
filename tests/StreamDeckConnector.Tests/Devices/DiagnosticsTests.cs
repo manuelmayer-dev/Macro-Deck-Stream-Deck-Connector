@@ -115,13 +115,10 @@ public sealed class DiagnosticsTests
 	}
 
 	[Test]
-	public async Task Unsupported_devices_are_exposed_with_attach_and_detach_events()
+	public async Task Unsupported_devices_are_exposed_while_they_are_attached()
 	{
 		var (manager, source, _, _) = Create();
 		await using var _ = manager;
-		var events = new EventRecorder<string>();
-		manager.UnsupportedDeviceAttached += d => events.Add($"attached {d.ProductId:X4} {d.Key}");
-		manager.UnsupportedDeviceDetached += d => events.Add($"detached {d.ProductId:X4} {d.Key}");
 		source.Plug(Studio());
 
 		await manager.StartAsync();
@@ -139,8 +136,28 @@ public sealed class DiagnosticsTests
 
 		source.Plug(Studio());
 		await manager.RefreshAsync();
+		Assert.That(manager.UnsupportedDevices.Single(), Is.EqualTo(first));
+	}
 
-		Assert.That(events.Events, Is.EqualTo((string[])[$"attached 00AA {first.Key}", $"detached 00AA {first.Key}", $"attached 00AA {first.Key}"]));
+	[Test]
+	public async Task Only_elgato_devices_that_look_like_a_stream_deck_are_reported_as_unsupported()
+	{
+		var (manager, source, sink, _) = Create();
+		await using var _ = manager;
+		source.Plug(new HidDeviceInfo("mic", 0x0FD9, 0x0070, "MIC", "Elgato Wave:3"));
+		source.Plug(new HidDeviceInfo("capture", 0x0FD9, 0x0079, "CAP", null));
+		source.Plug(new HidDeviceInfo("future", 0x0FD9, 0x00F0, "NEW", "STREAM DECK Mega"));
+		source.Plug(new HidDeviceInfo("studio-unnamed", 0x0FD9, 0x00AA, "ST", null));
+
+		await manager.StartAsync();
+		await manager.RefreshAsync();
+
+		Assert.That(manager.UnsupportedDevices.Select(d => d.ProductId).Order(), Is.EqualTo((int[])[0x00AA, 0x00F0]));
+		Assert.That(sink.Messages(LogEventLevel.Warning), Has.Count.EqualTo(2));
+		var ignored = sink.Messages(LogEventLevel.Debug).Where(m => m.StartsWith("Ignoring HID device", StringComparison.Ordinal)).ToList();
+		Assert.That(ignored, Has.Count.EqualTo(2), "each other Elgato device is logged once at Debug");
+		Assert.That(ignored.Any(m => m.Contains("Elgato Wave:3", StringComparison.Ordinal)), Is.True);
+		Assert.That(source.Connections, Is.Empty);
 	}
 
 	[Test]
@@ -307,6 +324,7 @@ public sealed class DiagnosticsTests
 		var connection = new FakeHidConnection();
 		StreamDeckModels.TryGet(0x0FD9, 0x0080, out var model);
 		await using var device = new StreamDeckDevice(model, "SERIAL", connection, new FakeTimeProvider(), logger, options);
+		device.Start();
 		await device.SetBrightnessAsync(5);
 
 		Assert.That(TraceLines(sink), Is.Empty);
@@ -336,6 +354,7 @@ public sealed class DiagnosticsTests
 		Assert.That(StreamDeckModels.TryGet(0x1B1C, 0x2B18, out var galleon), Is.True);
 		Assert.That((galleon.Rows, galleon.Columns, galleon.KeyPixelSize, galleon.VerifiedOnHardware), Is.EqualTo((4, 3, 160, false)));
 		await using var device = new StreamDeckDevice(galleon, "SERIAL", connection, time, Serilog.Core.Logger.None, new StreamDeckDiagnosticsOptions());
+		device.Start();
 		await connection.WaitForWritesAsync(1);
 
 		time.Advance(TimeSpan.FromMilliseconds(500));

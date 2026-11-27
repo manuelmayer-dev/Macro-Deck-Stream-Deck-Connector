@@ -27,7 +27,16 @@ public sealed class StreamDeckDeviceTests
 	private static byte[] Image(byte fill, int length) => [.. Enumerable.Repeat(fill, length)];
 
 	private static StreamDeckDevice Open(FakeHidConnection connection, FakeTimeProvider? time = null, int productId = Mk2) =>
-		new(Model(productId), "SERIAL", connection, time ?? new FakeTimeProvider(), Serilog.Core.Logger.None, new StreamDeckDiagnosticsOptions());
+		Started(Create(connection, Model(productId), time));
+
+	private static StreamDeckDevice Create(FakeHidConnection connection, StreamDeckModel model, FakeTimeProvider? time = null, Serilog.ILogger? logger = null) =>
+		new(model, "SERIAL", connection, time ?? new FakeTimeProvider(), logger ?? Serilog.Core.Logger.None, new StreamDeckDiagnosticsOptions());
+
+	private static StreamDeckDevice Started(StreamDeckDevice device)
+	{
+		device.Start();
+		return device;
+	}
 
 	private static IEnumerable<RecordedWrite> ImageWrites(IEnumerable<RecordedWrite> writes) =>
 		writes.Where(w => w.Kind == WriteKind.Output && w.Bytes[1] == 0x07);
@@ -189,33 +198,6 @@ public sealed class StreamDeckDeviceTests
 	}
 
 	[Test]
-	public async Task Clearing_a_key_sends_the_black_fill_feature_report_once()
-	{
-		var connection = new FakeHidConnection();
-		await using var device = Open(connection);
-
-		device.ClearKey(5);
-		await device.SetBrightnessAsync(1);
-		device.ClearKey(5);
-		await device.SetBrightnessAsync(2);
-
-		var writes = await connection.WaitForWritesAsync(1 + 1 + 1 + 1);
-		var expected = new byte[32];
-		expected[0] = 0x03;
-		expected[1] = 0x06;
-		expected[2] = 5;
-		Assert.That(writes.Where(w => w.Kind == WriteKind.SetFeature && w.Bytes[1] == 0x06).Select(w => w.Bytes), Is.EqualTo(new[] { expected }));
-	}
-
-	[Test]
-	public async Task Clearing_a_key_is_refused_where_the_protocol_cannot_do_it()
-	{
-		await using var device = Open(new FakeHidConnection(), productId: 0x0063);
-
-		Assert.Throws<NotSupportedException>(() => device.ClearKey(0));
-	}
-
-	[Test]
 	public async Task A_pedal_has_no_displays_but_still_reports_its_keys()
 	{
 		var connection = new FakeHidConnection();
@@ -224,7 +206,6 @@ public sealed class StreamDeckDeviceTests
 		device.KeyDown += events.Add;
 
 		Assert.Throws<NotSupportedException>(() => device.SetKeyImage(0, Image(1, 10)));
-		Assert.Throws<NotSupportedException>(() => device.ClearKey(0));
 		Assert.Throws<NotSupportedException>(() => device.SetBrightnessAsync(10));
 
 		var report = new byte[512];
@@ -239,9 +220,10 @@ public sealed class StreamDeckDeviceTests
 	public async Task A_read_failure_raises_disconnected_exactly_once_and_ends_the_device()
 	{
 		var connection = new FakeHidConnection();
-		var device = Open(connection);
+		var device = Create(connection, Model(Mk2));
 		var disconnects = new EventRecorder<Exception>();
 		device.Disconnected += disconnects.Add;
+		device.Start();
 		var failure = new IOException("unplugged");
 
 		connection.FailRead(failure);
@@ -260,15 +242,20 @@ public sealed class StreamDeckDeviceTests
 	public async Task A_write_failure_raises_disconnected_exactly_once_even_though_the_read_fails_afterwards()
 	{
 		var connection = new FakeHidConnection { WriteFailure = new IOException("write failed") };
-		var device = Open(connection);
+		var device = Create(connection, Model(Mk2));
 		var disconnects = new EventRecorder<Exception>();
+		// Subscribed before Start, so the failing reset write cannot be missed.
 		device.Disconnected += disconnects.Add;
+		var queued = device.SetBrightnessAsync(10);
+		device.Start();
 
 		await disconnects.WaitForAsync(1);
+		var thrown = Assert.ThrowsAsync<IOException>(async () => await queued);
 		await device.DisposeAsync();
 
 		Assert.That(disconnects.Events, Has.Count.EqualTo(1));
 		Assert.That(disconnects.Events[0].Message, Is.EqualTo("write failed"));
+		Assert.That(thrown, Is.SameAs(disconnects.Events[0]), "a command queued behind the failing write fails with it");
 	}
 
 	[Test]
@@ -293,7 +280,7 @@ public sealed class StreamDeckDeviceTests
 		var connection = new FakeHidConnection();
 		// 1024 bytes per second with a burst of two reports: the reset and the first chunk go out at once.
 		var slow = Model(Mk2) with { BytesPerSecond = 1024 };
-		await using var device = new StreamDeckDevice(slow, "SERIAL", connection, time, Serilog.Core.Logger.None, new StreamDeckDiagnosticsOptions());
+		await using var device = Started(Create(connection, slow, time));
 
 		device.SetKeyImage(0, Image(0x09, 2200));
 
@@ -335,9 +322,139 @@ public sealed class StreamDeckDeviceTests
 		await using var device = Open(connection);
 
 		Assert.That(await device.GetFirmwareVersionAsync(), Is.EqualTo("3.00.001"));
-		Assert.ThrowsAsync<IOException>(async () => await device.GetSerialNumberAsync());
+		Assert.Throws<IOException>(() => StreamDeckDevice.ReadSerialNumber(Model(Mk2), new FakeHidConnection { FeatureResponder = connection.FeatureResponder }));
 
 		// A failed query is not a disconnect.
 		Assert.That(connection.IsDisposed, Is.False);
+	}
+
+	[Test]
+	public void The_serial_is_read_from_the_feature_report_and_an_empty_answer_is_a_failure()
+	{
+		var connection = new FakeHidConnection
+		{
+			FeatureResponder = request =>
+			{
+				var report = new byte[request.Length];
+				report[0] = request[0];
+				report[1] = 12;
+				"AL12K1A01234"u8.CopyTo(report.AsSpan(2));
+				return request[0] == 0x06 ? report : throw new IOException("unsupported");
+			},
+		};
+
+		Assert.That(StreamDeckDevice.ReadSerialNumber(Model(Mk2), connection), Is.EqualTo("AL12K1A01234"));
+
+		connection.FeatureResponder = request => new byte[request.Length];
+		Assert.Throws<IOException>(() => StreamDeckDevice.ReadSerialNumber(Model(Mk2), connection));
+	}
+
+	[Test]
+	public async Task Nothing_is_written_before_start_and_work_queued_before_goes_out_after_the_reset()
+	{
+		var connection = new FakeHidConnection();
+		await using var device = Create(connection, Model(Mk2));
+		device.SetKeyImage(0, Image(0x11, 100));
+		var brightness = device.SetBrightnessAsync(40);
+
+		Assert.That(connection.Writes, Is.Empty);
+		device.Start();
+		await brightness;
+
+		var writes = await connection.WaitForWritesAsync(3);
+		Assert.That(writes.Select(w => (w.Kind, w.Bytes[1])), Is.EqualTo(new[]
+		{
+			(WriteKind.Output, (byte)0x00),
+			(WriteKind.Output, (byte)0x07),
+			(WriteKind.SetFeature, (byte)0x08),
+		}));
+	}
+
+	[Test]
+	public async Task A_refused_brightness_or_logo_report_fails_that_command_and_the_device_stays_open()
+	{
+		var (logger, sink) = CollectingSink.Create();
+		var connection = new FakeHidConnection();
+		var device = Create(connection, Model(Mk2), logger: logger);
+		var disconnects = 0;
+		device.Disconnected += _ => Interlocked.Increment(ref disconnects);
+		device.Start();
+		await using var _ = device;
+		await connection.WaitForWritesAsync(1);
+
+		connection.FeatureFailure = new IOException("report rejected");
+		Assert.ThrowsAsync<IOException>(async () => await device.SetBrightnessAsync(10));
+		Assert.ThrowsAsync<IOException>(async () => await device.ShowLogoAsync());
+		connection.FeatureFailure = null;
+		await device.SetBrightnessAsync(20);
+
+		Assert.That(connection.IsDisposed, Is.False);
+		Assert.That(disconnects, Is.Zero);
+		Assert.That(device.Counters.Snapshot().WriteFailures, Is.EqualTo(2));
+		Assert.That(device.Counters.Snapshot().LastError, Does.Contain("report rejected"));
+		var warnings = sink.Messages(Serilog.Events.LogEventLevel.Warning);
+		Assert.That(warnings, Has.Count.EqualTo(1), "one warning per run of refusals");
+		Assert.That(warnings[0], Does.Contain(StreamDeckSupport.IssuesUrl));
+		Assert.That(connection.Writes[^1].Bytes[2], Is.EqualTo(20));
+	}
+
+	[Test]
+	public async Task A_command_the_writer_is_executing_when_the_device_is_disposed_still_completes()
+	{
+		var time = new FakeTimeProvider();
+		var connection = new FakeHidConnection();
+		// The burst holds exactly the reset and one image report, so the brightness waits for the clock.
+		var slow = Model(Mk2) with { BytesPerSecond = 1024 };
+		var device = Create(connection, slow, time);
+		device.SetKeyImage(0, Image(0x01, 100));
+		var brightness = device.SetBrightnessAsync(10);
+		device.Start();
+		await connection.WaitForWritesAsync(2);
+		await time.WaitForActiveTimerAsync();
+
+		await device.DisposeAsync();
+
+		Assert.ThrowsAsync<InvalidOperationException>(async () => await brightness.WaitAsync(TimeSpan.FromSeconds(10)));
+	}
+
+	[Test]
+	public async Task A_command_cancelled_by_its_caller_while_it_waits_completes_as_cancelled()
+	{
+		var time = new FakeTimeProvider();
+		var connection = new FakeHidConnection();
+		var slow = Model(Mk2) with { BytesPerSecond = 1024 };
+		await using var device = Create(connection, slow, time);
+		using var cancel = new CancellationTokenSource();
+		device.SetKeyImage(0, Image(0x01, 100));
+		var brightness = device.SetBrightnessAsync(10, cancel.Token);
+		device.Start();
+		await time.WaitForActiveTimerAsync();
+
+		await cancel.CancelAsync();
+
+		Assert.CatchAsync<OperationCanceledException>(async () => await brightness.WaitAsync(TimeSpan.FromSeconds(10)));
+	}
+
+	[Test]
+	public async Task A_refused_keep_alive_is_counted_and_warned_about_once_without_ending_the_device()
+	{
+		var (logger, sink) = CollectingSink.Create();
+		var time = new FakeTimeProvider();
+		var connection = new FakeHidConnection { FeatureFailure = new IOException("pipe stalled") };
+		StreamDeckModels.TryGet(0x1B1C, 0x2B18, out var galleon);
+		await using var device = Started(Create(connection, galleon, time, logger));
+		await connection.WaitForWritesAsync(1);
+
+		await time.WaitForActiveTimerAsync();
+		time.Advance(TimeSpan.FromMilliseconds(500));
+		await connection.WaitForFeatureAttemptsAsync(1);
+		await time.WaitForActiveTimerAsync();
+		time.Advance(TimeSpan.FromMilliseconds(500));
+		await connection.WaitForFeatureAttemptsAsync(1);
+		await sink.WaitForAsync(e => e.Level == Serilog.Events.LogEventLevel.Debug && e.RenderMessage(System.Globalization.CultureInfo.InvariantCulture).Contains("KeepAlive", StringComparison.Ordinal));
+
+		Assert.That(connection.IsDisposed, Is.False);
+		Assert.That(device.Counters.Snapshot().WriteFailures, Is.EqualTo(2));
+		Assert.That(sink.Messages(Serilog.Events.LogEventLevel.Warning), Has.Count.EqualTo(1));
 	}
 }

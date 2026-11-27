@@ -7,8 +7,7 @@ public static class StreamDeckModels
 	public const int VendorId = 0x0FD9;
 	public const int CorsairVendorId = 0x1B1C;
 
-	// Rates are the ones StreamDeckSharp found glitch free (brief, part D). Models without a measured
-	// figure use the lower one.
+	// Rates are the ones StreamDeckSharp found glitch free. Models without a measured figure use the lower one.
 	private const int SafeRate = 1_500_000;
 	private const int FastRate = 3_200_000;
 
@@ -17,7 +16,7 @@ public static class StreamDeckModels
 		Gen2("Stream Deck Original (v2)", 0x006D, 3, 5, 72, 180, FastRate),
 		Gen2("Stream Deck MK.2", 0x0080, 3, 5, 72, 180, SafeRate, verified: true),
 		Gen2("Stream Deck MK.2 (Scissor)", 0x00A5, 3, 5, 72, 180, SafeRate),
-		// The brief notes python names 0x00B9 MK2_MODULE and MK2_V2 in different places. Elgato, node and rust call it the 15-key module.
+		// python-elgato-streamdeck names 0x00B9 MK2_MODULE and MK2_V2 in different places. Elgato, node and rust call it the 15-key module.
 		Gen2("Stream Deck 15-Key Module", 0x00B9, 3, 5, 72, 180, SafeRate),
 		Gen2("Stream Deck 15-Key Module (Scissor)", 0x00E4, 3, 5, 72, 180, SafeRate),
 		Gen2("Stream Deck XL", 0x006C, 4, 8, 96, 180, SafeRate),
@@ -29,8 +28,10 @@ public static class StreamDeckModels
 		// Neo: the 8 LCD keys only. The two touch keys (indices 8 and 9) and the info screen are ignored.
 		Gen2("Stream Deck Neo", 0x009A, 2, 4, 96, 180, SafeRate),
 		new StreamDeckModel("Stream Deck Pedal", VendorId, 0x0086, 1, 3, 0, StreamDeckImageFormat.None, 0, false, StreamDeckProtocolFamily.Gen2, 0),
-		// Original v1 image orientation is untested on hardware: python flips both axes, node only X (brief, part A).
-		new StreamDeckModel("Stream Deck Original (v1)", VendorId, 0x0060, 3, 5, 72, StreamDeckImageFormat.Bmp, 0, true, StreamDeckProtocolFamily.OriginalV1, FastRate),
+		// Untested on hardware. python-elgato-streamdeck flips both axes and saves a standard bottom-up BMP,
+		// which is a 180 degree turn. Node mirrors only X but writes its rows top-down into a bottom-up BMP,
+		// which ends up as the same bytes.
+		new StreamDeckModel("Stream Deck Original (v1)", VendorId, 0x0060, 3, 5, 72, StreamDeckImageFormat.Bmp, 180, false, StreamDeckProtocolFamily.OriginalV1, FastRate),
 		Mini("Stream Deck Mini", 0x0063),
 		Mini("Stream Deck Mini (2022)", 0x0090),
 		Mini("Stream Deck Mini Discord Edition", 0x00B3),
@@ -38,7 +39,8 @@ public static class StreamDeckModels
 		// Galleon K100 SD, from the node library only: a 3 column by 4 row grid, gen2 key images and
 		// input (key states at the same offset as gen2), no flip or rotation, encoders and the LCD
 		// segment ignored. Node pings it with feature report 03 27 every 500 ms, so a keep-alive is sent.
-		// Open point: node also filters on HID usage 0x01 and interface 0, which this transport does not.
+		// The keyboard has more HID interfaces with the same serial. The manager only opens the one whose
+		// output report is long enough for gen2 key images, where node filters on usage 0x01 and interface 0.
 		new StreamDeckModel("Corsair Galleon K100 SD", CorsairVendorId, 0x2B18, 4, 3, 160, StreamDeckImageFormat.Jpeg, 0, false, StreamDeckProtocolFamily.Gen2, SafeRate, SendsKeepAlive: true),
 	}.ToFrozenDictionary(m => Key(m.VendorId, m.ProductId));
 
@@ -61,6 +63,9 @@ public static class StreamDeckModels
 	private static StreamDeckModel Gen2(string name, int productId, int rows, int columns, int keyPixelSize, int rotation, int rate, bool verified = false) =>
 		new(name, VendorId, productId, rows, columns, keyPixelSize, StreamDeckImageFormat.Jpeg, rotation, false, StreamDeckProtocolFamily.Gen2, rate, verified);
 
+	// python-elgato-streamdeck turns the picture 90 degrees counter-clockwise, flips it top to bottom and
+	// saves a standard bottom-up BMP. That is a transpose, which is a mirror followed by a 270 degree
+	// clockwise turn. Node's rotate plus Y flip with top-down rows in a bottom-up BMP gives the same bytes.
 	private static StreamDeckModel Mini(string name, int productId) =>
-		new(name, VendorId, productId, 2, 3, 80, StreamDeckImageFormat.Bmp, 90, false, StreamDeckProtocolFamily.Mini, SafeRate);
+		new(name, VendorId, productId, 2, 3, 80, StreamDeckImageFormat.Bmp, 270, true, StreamDeckProtocolFamily.Mini, SafeRate);
 }

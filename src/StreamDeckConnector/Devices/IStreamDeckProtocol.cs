@@ -12,10 +12,11 @@ public interface IStreamDeckProtocol
 
 	int FeatureReportLength { get; }
 
+	/// <summary>Shortest input report that still carries every key state.</summary>
+	int MinimumInputReportLength { get; }
+
 	/// <summary>Sent once after open to abort a half-sent image, empty when the family has none.</summary>
 	ReadOnlyMemory<byte> ResetKeyStreamReport { get; }
-
-	bool SupportsClearKey { get; }
 
 	/// <summary>Number of leading bytes of a key image report that are header, the rest is picture payload.</summary>
 	int KeyImageHeaderLength { get; }
@@ -38,8 +39,6 @@ public interface IStreamDeckProtocol
 
 	/// <summary>Fills <paramref name="report"/> (<see cref="OutputReportLength"/> bytes) with one chunk of the image, zero padded.</summary>
 	void BuildKeyImageReport(int logicalKey, ReadOnlySpan<byte> image, int reportIndex, Span<byte> report);
-
-	void BuildClearKeyReport(int logicalKey, Span<byte> featureReport);
 
 	void BuildBrightnessReport(int percent, Span<byte> featureReport);
 

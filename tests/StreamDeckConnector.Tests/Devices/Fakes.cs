@@ -17,6 +17,7 @@ public sealed class FakeHidConnection : IHidConnection
 	private readonly BlockingCollection<object> _inputs = [];
 	private readonly CancellationTokenSource _disposed = new();
 	private readonly SemaphoreSlim _writeSignal = new(0);
+	private readonly SemaphoreSlim _featureAttempt = new(0);
 	private readonly List<RecordedWrite> _writes = [];
 	private readonly object _lock = new();
 
@@ -24,6 +25,9 @@ public sealed class FakeHidConnection : IHidConnection
 	public Action<int>? BeforeWrite { get; set; }
 
 	public Exception? WriteFailure { get; set; }
+
+	/// <summary>Thrown by set feature requests only, after <see cref="BeforeWrite"/> ran.</summary>
+	public Exception? FeatureFailure { get; set; }
 
 	public Func<byte[], byte[]>? FeatureResponder { get; set; }
 
@@ -80,6 +84,15 @@ public sealed class FakeHidConnection : IHidConnection
 
 	public void WriteOutputReport(ReadOnlySpan<byte> report) => Record(WriteKind.Output, report);
 
+	/// <summary>Waits until the writer attempted <paramref name="count"/> more set feature requests, refused ones included.</summary>
+	public async Task WaitForFeatureAttemptsAsync(int count)
+	{
+		for (var i = 0; i < count; i++)
+		{
+			await _featureAttempt.WaitAsync().WaitAsync(TimeSpan.FromSeconds(10));
+		}
+	}
+
 	public void SetFeatureReport(ReadOnlySpan<byte> report) => Record(WriteKind.SetFeature, report);
 
 	public void GetFeatureReport(Span<byte> buffer)
@@ -103,6 +116,15 @@ public sealed class FakeHidConnection : IHidConnection
 		}
 
 		BeforeWrite?.Invoke(index);
+		if (kind == WriteKind.SetFeature)
+		{
+			_featureAttempt.Release();
+			if (FeatureFailure is { } refused)
+			{
+				throw refused;
+			}
+		}
+
 		if (WriteFailure is { } failure)
 		{
 			throw failure;
@@ -141,6 +163,17 @@ public sealed class FakeTimeProvider : TimeProvider
 		return timer;
 	}
 
+	public bool HasActiveTimer
+	{
+		get
+		{
+			lock (_lock)
+			{
+				return _timers.Any(t => t.IsScheduled);
+			}
+		}
+	}
+
 	/// <summary>Completes when a timer is waiting. A timer that already fired no longer counts.</summary>
 	public Task WaitForActiveTimerAsync()
 	{
@@ -165,7 +198,16 @@ public sealed class FakeTimeProvider : TimeProvider
 			due = [.. _timers.Where(t => t.IsScheduled && t.DueAt <= _now)];
 			foreach (var timer in due)
 			{
-				timer.MarkFired();
+				// A periodic timer stays scheduled one period from now, a one-shot timer is done.
+				if (timer.Period is { } period)
+				{
+					timer.DueAt = _now + period.Ticks;
+				}
+				else
+				{
+					timer.DueAt = null;
+					_timers.Remove(timer);
+				}
 			}
 		}
 
@@ -175,11 +217,12 @@ public sealed class FakeTimeProvider : TimeProvider
 		}
 	}
 
-	private void Schedule(FakeTimer timer, TimeSpan dueTime)
+	private void Schedule(FakeTimer timer, TimeSpan dueTime, TimeSpan period)
 	{
 		lock (_lock)
 		{
 			_timers.Remove(timer);
+			timer.Period = period > TimeSpan.Zero && period != Timeout.InfiniteTimeSpan ? period : null;
 			if (dueTime == Timeout.InfiniteTimeSpan)
 			{
 				timer.DueAt = null;
@@ -204,18 +247,14 @@ public sealed class FakeTimeProvider : TimeProvider
 	{
 		public long? DueAt { get; set; }
 
+		public TimeSpan? Period { get; set; }
+
 		public bool IsScheduled => DueAt is not null;
 
 		public bool Change(TimeSpan dueTime, TimeSpan period)
 		{
-			owner.Schedule(this, dueTime);
+			owner.Schedule(this, dueTime, period);
 			return true;
-		}
-
-		public void MarkFired()
-		{
-			DueAt = null;
-			owner._timers.Remove(this);
 		}
 
 		public void Fire() => callback(state);
@@ -241,6 +280,12 @@ public sealed class FakeHidDeviceSource : IHidDeviceSource
 
 	public Func<byte[], byte[]>? FeatureResponder { get; set; }
 
+	/// <summary>Thrown by <see cref="Enumerate"/> while set.</summary>
+	public Exception? EnumerateFailure { get; set; }
+
+	/// <summary>Runs on every new connection before the device gets it.</summary>
+	public Action<HidDeviceInfo, FakeHidConnection>? ConfigureConnection { get; set; }
+
 	public event EventHandler? Changed;
 
 	public void Plug(HidDeviceInfo info)
@@ -263,6 +308,11 @@ public sealed class FakeHidDeviceSource : IHidDeviceSource
 
 	public IReadOnlyList<HidDeviceInfo> Enumerate()
 	{
+		if (EnumerateFailure is { } failure)
+		{
+			throw failure;
+		}
+
 		lock (_lock)
 		{
 			return [.. _present];
@@ -277,6 +327,7 @@ public sealed class FakeHidDeviceSource : IHidDeviceSource
 		}
 
 		var connection = new FakeHidConnection { FeatureResponder = FeatureResponder };
+		ConfigureConnection?.Invoke(device, connection);
 		lock (_lock)
 		{
 			Connections[device.Path] = connection;

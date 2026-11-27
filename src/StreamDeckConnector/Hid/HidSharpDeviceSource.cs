@@ -57,7 +57,7 @@ public sealed class HidSharpDeviceSource : IHidDeviceSource, IDisposable
 		{
 			// The default read timeout is 3 s and would end an idle reader.
 			stream.ReadTimeout = Timeout.Infinite;
-			return new HidSharpConnection(stream, hidDevice.GetMaxInputReportLength());
+			return new HidSharpConnection(stream, hidDevice.GetMaxInputReportLength(), Safe(hidDevice.GetMaxFeatureReportLength, 0));
 		}
 		catch
 		{
@@ -136,13 +136,15 @@ public sealed class HidSharpDeviceSource : IHidDeviceSource, IDisposable
 	{
 		private readonly HidStream _stream;
 		private readonly byte[] _readBuffer;
+		private readonly int _featureReportLength;
 		private byte[] _writeBuffer = [];
 		private byte[] _featureBuffer = [];
 
-		public HidSharpConnection(HidStream stream, int maxInputReportLength)
+		public HidSharpConnection(HidStream stream, int maxInputReportLength, int maxFeatureReportLength)
 		{
 			_stream = stream;
 			_readBuffer = new byte[Math.Max(maxInputReportLength, 1)];
+			_featureReportLength = Math.Max(maxFeatureReportLength, 0);
 		}
 
 		public int ReadInputReport(Span<byte> destination, CancellationToken cancellationToken)
@@ -166,33 +168,44 @@ public sealed class HidSharpDeviceSource : IHidDeviceSource, IDisposable
 
 		public void WriteOutputReport(ReadOnlySpan<byte> report)
 		{
-			Fill(ref _writeBuffer, report);
+			// HidSharp pads output reports to the device length on Windows itself.
+			if (_writeBuffer.Length != report.Length)
+			{
+				_writeBuffer = new byte[report.Length];
+			}
+
+			report.CopyTo(_writeBuffer);
 			_stream.Write(_writeBuffer, 0, report.Length);
 		}
 
 		public void SetFeatureReport(ReadOnlySpan<byte> report)
 		{
-			Fill(ref _featureBuffer, report);
-			_stream.SetFeature(_featureBuffer, 0, report.Length);
+			var length = PrepareFeatureBuffer(report);
+			_stream.SetFeature(_featureBuffer, 0, length);
 		}
 
 		public void GetFeatureReport(Span<byte> buffer)
 		{
-			Fill(ref _featureBuffer, buffer);
-			_stream.GetFeature(_featureBuffer, 0, buffer.Length);
+			var length = PrepareFeatureBuffer(buffer);
+			_stream.GetFeature(_featureBuffer, 0, length);
 			_featureBuffer.AsSpan(0, buffer.Length).CopyTo(buffer);
 		}
 
 		public void Dispose() => _stream.Dispose();
 
-		private static void Fill(ref byte[] target, ReadOnlySpan<byte> source)
+		// Windows rejects a feature report shorter than the device's feature report length, and HidSharp
+		// passes the length to HidD_SetFeature and HidD_GetFeature unchanged, so the report is zero padded here.
+		private int PrepareFeatureBuffer(ReadOnlySpan<byte> report)
 		{
-			if (target.Length != source.Length)
+			var length = Math.Max(report.Length, _featureReportLength);
+			if (_featureBuffer.Length != length)
 			{
-				target = new byte[source.Length];
+				_featureBuffer = new byte[length];
 			}
 
-			source.CopyTo(target);
+			report.CopyTo(_featureBuffer);
+			_featureBuffer.AsSpan(report.Length).Clear();
+			return length;
 		}
 	}
 }

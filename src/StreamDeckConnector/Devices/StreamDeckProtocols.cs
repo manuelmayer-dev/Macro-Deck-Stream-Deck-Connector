@@ -40,7 +40,7 @@ public static class StreamDeckProtocols
 	}
 }
 
-/// <summary>Original v2, MK.2, XL, Plus, Plus XL, Neo, Pedal and the modules (brief, part A "Gen 2").</summary>
+/// <summary>Original v2, MK.2, XL, Plus, Plus XL, Neo, Pedal and the modules, as Elgato documents them and python-elgato-streamdeck and node implement them.</summary>
 public sealed class Gen2Protocol : IStreamDeckProtocol
 {
 	private const int HeaderLength = 8;
@@ -63,9 +63,9 @@ public sealed class Gen2Protocol : IStreamDeckProtocol
 
 	public int FeatureReportLength => FeatureLength;
 
-	public ReadOnlyMemory<byte> ResetKeyStreamReport => _resetKeyStream;
+	public int MinimumInputReportLength => KeyStatesOffset + _keyCount;
 
-	public bool SupportsClearKey => true;
+	public ReadOnlyMemory<byte> ResetKeyStreamReport => _resetKeyStream;
 
 	public int KeyImageHeaderLength => HeaderLength;
 
@@ -120,15 +120,6 @@ public sealed class Gen2Protocol : IStreamDeckProtocol
 		chunk.CopyTo(report[HeaderLength..]);
 	}
 
-	public void BuildClearKeyReport(int logicalKey, Span<byte> featureReport)
-	{
-		StreamDeckProtocols.CheckReportLength(featureReport, FeatureLength);
-		featureReport.Clear();
-		featureReport[0] = 0x03;
-		featureReport[1] = 0x06;
-		featureReport[2] = (byte)ToDeviceKey(logicalKey);
-	}
-
 	public void BuildBrightnessReport(int percent, Span<byte> featureReport)
 	{
 		StreamDeckProtocols.CheckReportLength(featureReport, FeatureLength);
@@ -175,7 +166,7 @@ public sealed class Gen2Protocol : IStreamDeckProtocol
 
 	private static byte[] CreateResetKeyStream()
 	{
-		// Only python sends this (brief, part A), and it is harmless on a device that is idle.
+		// Only python-elgato-streamdeck sends this, and it is harmless on a device that is idle.
 		var report = new byte[ReportLength];
 		report[0] = 0x02;
 		return report;
@@ -203,9 +194,9 @@ public sealed class OriginalV1Protocol : IStreamDeckProtocol
 
 	public int FeatureReportLength => FeatureLength;
 
-	public ReadOnlyMemory<byte> ResetKeyStreamReport => ReadOnlyMemory<byte>.Empty;
+	public int MinimumInputReportLength => KeyStatesOffset + _keyCount;
 
-	public bool SupportsClearKey => false;
+	public ReadOnlyMemory<byte> ResetKeyStreamReport => ReadOnlyMemory<byte>.Empty;
 
 	public int KeyImageHeaderLength => HeaderLength;
 
@@ -253,9 +244,6 @@ public sealed class OriginalV1Protocol : IStreamDeckProtocol
 		report[5] = (byte)(ToDeviceKey(logicalKey) + 1);
 		image.Slice(reportIndex * half, half).CopyTo(report[HeaderLength..]);
 	}
-
-	public void BuildClearKeyReport(int logicalKey, Span<byte> featureReport) =>
-		throw new NotSupportedException("The Original v1 has no way to blank a key without an image.");
 
 	public void BuildBrightnessReport(int percent, Span<byte> featureReport)
 	{
@@ -319,9 +307,9 @@ public sealed class MiniProtocol : IStreamDeckProtocol
 
 	public int FeatureReportLength => 17;
 
-	public ReadOnlyMemory<byte> ResetKeyStreamReport => ReadOnlyMemory<byte>.Empty;
+	public int MinimumInputReportLength => KeyStatesOffset + _keyCount;
 
-	public bool SupportsClearKey => false;
+	public ReadOnlyMemory<byte> ResetKeyStreamReport => ReadOnlyMemory<byte>.Empty;
 
 	public int KeyImageHeaderLength => HeaderLength;
 
@@ -376,9 +364,6 @@ public sealed class MiniProtocol : IStreamDeckProtocol
 		report[5] = (byte)(ToDeviceKey(logicalKey) + 1);
 		chunk.CopyTo(report[HeaderLength..]);
 	}
-
-	public void BuildClearKeyReport(int logicalKey, Span<byte> featureReport) =>
-		throw new NotSupportedException("The Mini family has no way to blank a key without an image.");
 
 	public void BuildBrightnessReport(int percent, Span<byte> featureReport)
 	{

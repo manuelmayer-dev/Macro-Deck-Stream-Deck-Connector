@@ -179,3 +179,9 @@ public sealed record UnsupportedDevice(string Key, int VendorId, int ProductId, 
 }
 
 public sealed record OpenFailure(string ModelName, string SerialTail, string Error);
+
+internal static class Failures
+{
+	// Everything else is logged and survived: one bad device or a bad report must not take the plugin down.
+	public static bool IsFatal(Exception exception) => exception is OutOfMemoryException or InsufficientExecutionStackException;
+}

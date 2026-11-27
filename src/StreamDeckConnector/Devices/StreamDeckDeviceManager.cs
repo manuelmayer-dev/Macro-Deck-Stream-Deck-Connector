@@ -10,11 +10,17 @@ namespace StreamDeckConnector.Devices;
 /// <summary>
 /// Keeps one <see cref="StreamDeckDevice"/> open per supported device the source reports. A device that
 /// comes back, even with the same serial, is a new object. A device that failed on its own is dropped
-/// and only reopened on the next change notification from the source. Devices from the Elgato vendor
-/// that are not in the catalogue are never opened, only reported.
+/// and only reopened on the next change notification from the source. A device that could not be
+/// opened is retried on a timer while it stays attached. Elgato devices that are not in the catalogue
+/// are never opened, and only reported when they look like a Stream Deck.
 /// </summary>
 public sealed class StreamDeckDeviceManager : IAsyncDisposable
 {
+	private static readonly TimeSpan _openRetryInterval = TimeSpan.FromSeconds(5);
+
+	// Elgato Stream Decks whose product string might not say so, and that this plugin cannot drive.
+	private static readonly HashSet<int> _knownUnsupportedProductIds = [0x00AA];
+
 	private readonly IHidDeviceSource _source;
 	private readonly TimeProvider _timeProvider;
 	private readonly ILogger _logger;
@@ -25,6 +31,11 @@ public sealed class StreamDeckDeviceManager : IAsyncDisposable
 	private readonly Dictionary<string, DeviceRecord> _records = [];
 	private readonly Dictionary<string, UnsupportedDevice> _unsupportedByPath = [];
 	private readonly Dictionary<string, OpenFailure> _openFailing = [];
+	private readonly HashSet<string> _ignoredPaths = [];
+	private ITimer? _retryTimer;
+	private object? _retryTimerToken;
+	private int? _brightness;
+	private bool _enumerationFailing;
 	private bool _started;
 	private bool _disposed;
 
@@ -79,10 +90,6 @@ public sealed class StreamDeckDeviceManager : IAsyncDisposable
 
 	public event Action<StreamDeckDevice>? DeviceDisconnected;
 
-	public event Action<UnsupportedDevice>? UnsupportedDeviceAttached;
-
-	public event Action<UnsupportedDevice>? UnsupportedDeviceDetached;
-
 	/// <summary>Starts watching the source and opens what is already plugged in.</summary>
 	public Task StartAsync()
 	{
@@ -112,20 +119,41 @@ public sealed class StreamDeckDeviceManager : IAsyncDisposable
 				return;
 			}
 
-			IReadOnlyList<HidDeviceInfo> all;
-			try
-			{
-				all = _source.Enumerate();
-			}
-			catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+			if (!TryEnumerate(out var all))
 			{
 				return;
 			}
 
-			var present = all.Where(IsSupported).ToList();
-			var unsupported = all.Where(IsUnsupportedStreamDeck).ToList();
-			var paths = all.Select(info => info.Path).ToHashSet(StringComparer.Ordinal);
+			List<HidDeviceInfo> present = [];
+			List<HidDeviceInfo> unsupported = [];
+			List<(HidDeviceInfo Info, string Reason)> ignored = [];
+			foreach (var info in all)
+			{
+				if (StreamDeckModels.TryGet(info.VendorId, info.ProductId, out var model))
+				{
+					if (FitsProtocol(info, model))
+					{
+						present.Add(info);
+					}
+					else
+					{
+						ignored.Add((info, $"another HID interface of {model.Name}, its report lengths do not fit the protocol"));
+					}
+				}
+				else if (info.VendorId == StreamDeckModels.VendorId)
+				{
+					if (LooksLikeStreamDeck(info))
+					{
+						unsupported.Add(info);
+					}
+					else
+					{
+						ignored.Add((info, "an Elgato device that is not a Stream Deck"));
+					}
+				}
+			}
 
+			var paths = all.Select(info => info.Path).ToHashSet(StringComparer.Ordinal);
 			lock (_stateLock)
 			{
 				foreach (var gone in _openFailing.Keys.Where(path => !paths.Contains(path)).ToList())
@@ -136,12 +164,38 @@ public sealed class StreamDeckDeviceManager : IAsyncDisposable
 
 			await CloseMissingAsync(present).ConfigureAwait(false);
 			UpdateUnsupported(unsupported);
+			UpdateIgnored(ignored);
 			OpenNew(present);
+			UpdateRetryTimer();
 		}
 		finally
 		{
 			_refreshGate.Release();
 		}
+	}
+
+	/// <summary>
+	/// Sets the brightness of every connected device with key displays, and remembers it for every device
+	/// that connects later. Returns how many devices took it, 0 when none with displays is connected (the
+	/// value is still remembered). Every device is tried, then the first failure is thrown: the HID error of
+	/// a device that refused the report, <see cref="InvalidOperationException"/> for one that ended
+	/// meanwhile, <see cref="OperationCanceledException"/> when cancelled.
+	/// </summary>
+	public async Task<int> SetBrightnessAsync(int percent, CancellationToken cancellationToken = default)
+	{
+		ArgumentOutOfRangeException.ThrowIfNegative(percent);
+		ArgumentOutOfRangeException.ThrowIfGreaterThan(percent, 100);
+		List<StreamDeckDevice> targets;
+		lock (_stateLock)
+		{
+			ObjectDisposedException.ThrowIf(_disposed, this);
+			// Under the same lock as registering a device, so a device connecting now either is a target or sees the new value.
+			_brightness = percent;
+			targets = [.. _devicesByPath.Values.Where(device => device.Model.HasKeyImages)];
+		}
+
+		await Task.WhenAll(targets.Select(device => device.SetBrightnessAsync(percent, cancellationToken))).ConfigureAwait(false);
+		return targets.Count;
 	}
 
 	/// <summary>A plain text snapshot a user can paste into an issue.</summary>
@@ -201,6 +255,7 @@ public sealed class StreamDeckDeviceManager : IAsyncDisposable
 				_disposed = true;
 				devices = [.. _devicesByPath.Values];
 				_devicesByPath.Clear();
+				StopRetryTimer();
 			}
 		}
 		finally
@@ -220,11 +275,71 @@ public sealed class StreamDeckDeviceManager : IAsyncDisposable
 		?? typeof(StreamDeckDeviceManager).Assembly.GetName().Version?.ToString()
 		?? "unknown";
 
-	private static bool IsSupported(HidDeviceInfo info) => StreamDeckModels.TryGet(info.VendorId, info.ProductId, out _);
+	// A device with several HID collections (the Galleon keyboard, or a second collection of any model)
+	// shows up once per collection. Only the one whose reports fit the protocol is the deck. Unknown
+	// lengths (-1) do not rule a device out.
+	private static bool FitsProtocol(HidDeviceInfo info, StreamDeckModel model)
+	{
+		var protocol = StreamDeckProtocols.Create(model);
+		if (model.HasKeyImages && info.OutputReportLength >= 0 && info.OutputReportLength < protocol.OutputReportLength)
+		{
+			return false;
+		}
 
-	private static bool IsUnsupportedStreamDeck(HidDeviceInfo info) => info.VendorId == StreamDeckModels.VendorId && !IsSupported(info);
+		return info.InputReportLength < 0 || info.InputReportLength >= protocol.MinimumInputReportLength;
+	}
 
-	private void OnSourceChanged(object? sender, EventArgs e) => _ = RefreshAsync();
+	private static bool LooksLikeStreamDeck(HidDeviceInfo info) =>
+		_knownUnsupportedProductIds.Contains(info.ProductId)
+		|| (info.ProductName?.Contains("Stream Deck", StringComparison.OrdinalIgnoreCase) ?? false);
+
+	private static string FallbackIdentity(StreamDeckModel model, HidDeviceInfo info) =>
+		$"{model.VendorId:x4}{model.ProductId:x4}-port-{UnsupportedDevice.KeyFor(info.Path).ToLowerInvariant()}";
+
+	private void OnSourceChanged(object? sender, EventArgs e) => _ = RefreshObservedAsync();
+
+	// For refreshes nobody awaits: a failure is logged instead of vanishing with the task.
+	private async Task RefreshObservedAsync()
+	{
+		try
+		{
+			await RefreshAsync().ConfigureAwait(false);
+		}
+		catch (Exception ex) when (!Failures.IsFatal(ex))
+		{
+			_logger.Error(ex, "Refreshing the Stream Deck list failed: {Error:l}. Please open an issue at " + StreamDeckSupport.IssuesUrl + " and attach the diagnostics snapshot.", ex.Message);
+		}
+	}
+
+	private bool TryEnumerate(out IReadOnlyList<HidDeviceInfo> all)
+	{
+		try
+		{
+			all = _source.Enumerate();
+		}
+		catch (Exception ex) when (!Failures.IsFatal(ex))
+		{
+			all = [];
+			if (!_enumerationFailing)
+			{
+				_enumerationFailing = true;
+				_logger.Warning(
+					"Could not list the attached HID devices: {Error:l}. Stream Decks are not updated until this works again. If it persists, please open an issue at "
+					+ StreamDeckSupport.IssuesUrl + " and attach the diagnostics snapshot.",
+					ex.Message);
+			}
+
+			return false;
+		}
+
+		if (_enumerationFailing)
+		{
+			_enumerationFailing = false;
+			_logger.Information("Listing the attached HID devices works again");
+		}
+
+		return true;
+	}
 
 	private async Task CloseMissingAsync(IReadOnlyList<HidDeviceInfo> present)
 	{
@@ -255,15 +370,12 @@ public sealed class StreamDeckDeviceManager : IAsyncDisposable
 	private void UpdateUnsupported(IReadOnlyList<HidDeviceInfo> unsupported)
 	{
 		var paths = unsupported.Select(info => info.Path).ToHashSet(StringComparer.Ordinal);
-		List<UnsupportedDevice> detached;
 		List<UnsupportedDevice> attached = [];
 		lock (_stateLock)
 		{
-			var gone = _unsupportedByPath.Where(pair => !paths.Contains(pair.Key)).ToList();
-			detached = [.. gone.Select(pair => pair.Value)];
-			foreach (var pair in gone)
+			foreach (var gone in _unsupportedByPath.Keys.Where(path => !paths.Contains(path)).ToList())
 			{
-				_unsupportedByPath.Remove(pair.Key);
+				_unsupportedByPath.Remove(gone);
 			}
 
 			foreach (var info in unsupported.Where(info => !_unsupportedByPath.ContainsKey(info.Path)))
@@ -272,11 +384,6 @@ public sealed class StreamDeckDeviceManager : IAsyncDisposable
 				_unsupportedByPath[info.Path] = device;
 				attached.Add(device);
 			}
-		}
-
-		foreach (var device in detached)
-		{
-			Raise(UnsupportedDeviceDetached, device);
 		}
 
 		foreach (var device in attached)
@@ -291,7 +398,24 @@ public sealed class StreamDeckDeviceManager : IAsyncDisposable
 				device.InputReportLength,
 				device.OutputReportLength,
 				device.FeatureReportLength);
-			Raise(UnsupportedDeviceAttached, device);
+		}
+	}
+
+	private void UpdateIgnored(IReadOnlyList<(HidDeviceInfo Info, string Reason)> ignored)
+	{
+		var paths = ignored.Select(entry => entry.Info.Path).ToHashSet(StringComparer.Ordinal);
+		_ignoredPaths.RemoveWhere(path => !paths.Contains(path));
+		foreach (var (info, reason) in ignored.Where(entry => _ignoredPaths.Add(entry.Info.Path)))
+		{
+			_logger.Debug(
+				"Ignoring HID device vendor 0x{VendorId:X4}, product 0x{ProductId:X4}, product string '{ProductName:l}', report lengths input {InputLength} output {OutputLength} feature {FeatureLength}: {Reason:l}",
+				info.VendorId,
+				info.ProductId,
+				info.ProductName,
+				info.InputReportLength,
+				info.OutputReportLength,
+				info.FeatureReportLength,
+				reason);
 		}
 	}
 
@@ -308,55 +432,172 @@ public sealed class StreamDeckDeviceManager : IAsyncDisposable
 			}
 
 			StreamDeckModels.TryGet(info.VendorId, info.ProductId, out var model);
-			var serial = string.IsNullOrEmpty(info.SerialNumber) ? info.Path : info.SerialNumber;
-			DeviceRecord record;
-			lock (_stateLock)
-			{
-				record = GetRecord(serial, model, info);
-			}
-
-			StreamDeckDevice device;
 			try
 			{
-				var connection = _source.Open(info);
-				device = new StreamDeckDevice(model, serial, connection, _timeProvider, _logger, _options, record.Counters);
+				Open(info, model);
 			}
-			catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+			catch (Exception ex) when (!Failures.IsFatal(ex))
 			{
-				// Another process may hold it, or it vanished again. The next change notification retries.
+				// Another process may hold it, it vanished again, or it misbehaved. The retry timer tries again.
 				bool firstOfEpisode;
+				var serialTail = SerialMask.Tail(info.SerialNumber);
 				lock (_stateLock)
 				{
-					firstOfEpisode = _openFailing.TryAdd(info.Path, new OpenFailure(model.Name, record.SerialTail, ex.Message));
-					record.LastError = $"open failure: {ex.Message}";
+					firstOfEpisode = _openFailing.TryAdd(info.Path, new OpenFailure(model.Name, serialTail, ex.Message));
+					// Without a USB serial the identity is only known once the device is open, so there is no record to note it on.
+					if (!string.IsNullOrEmpty(info.SerialNumber))
+					{
+						GetRecord(info.SerialNumber, serialTail, model, info).LastError = $"open failure: {ex.Message}";
+					}
 				}
 
 				if (firstOfEpisode)
 				{
-					_logger.Warning("Could not open {Model:l} (serial ending {SerialTail:l}): {Error:l}", model.Name, record.SerialTail, ex.Message);
+					_logger.Warning(
+						"Could not open {Model:l} (serial ending {SerialTail:l}): {Error:l}. It is retried every {RetrySeconds} s while it stays attached. "
+						+ "If another program uses it, close that program. Otherwise please open an issue at " + StreamDeckSupport.IssuesUrl + " and attach the diagnostics snapshot.",
+						model.Name,
+						serialTail,
+						ex.Message,
+						(int)_openRetryInterval.TotalSeconds);
 				}
-
-				continue;
 			}
+		}
+	}
 
+	private void Open(HidDeviceInfo info, StreamDeckModel model)
+	{
+		var connection = _source.Open(info);
+		StreamDeckDevice device;
+		DeviceRecord record;
+		int? brightness;
+		try
+		{
+			var (serial, serialTail) = ResolveIdentity(info, model, connection);
 			lock (_stateLock)
 			{
-				_openFailing.Remove(info.Path);
-				_devicesByPath[info.Path] = device;
-				record.Info = info;
-				if (record.EverConnected)
-				{
-					record.Reconnects++;
-				}
-
-				record.EverConnected = true;
-				record.Connected = true;
+				record = GetRecord(serial, serialTail, model, info);
 			}
 
-			device.Disconnected += failure => OnDeviceFailed(device, failure);
-			Raise(DeviceConnected, device);
-			_ = LogConnectedAsync(device, record);
+			device = new StreamDeckDevice(model, serial, connection, _timeProvider, _logger, _options, record.Counters);
 		}
+		catch
+		{
+			connection.Dispose();
+			throw;
+		}
+
+		device.Disconnected += failure => OnDeviceFailed(device, failure);
+		lock (_stateLock)
+		{
+			_openFailing.Remove(info.Path);
+			_devicesByPath[info.Path] = device;
+			record.Info = info;
+			if (record.EverConnected)
+			{
+				record.Reconnects++;
+			}
+
+			record.EverConnected = true;
+			record.Connected = true;
+			brightness = _brightness;
+		}
+
+		// Queued before the device starts, so the brightness goes out ahead of the first pictures.
+		if (brightness is { } percent && model.HasKeyImages)
+		{
+			_ = ApplyBrightnessAsync(device, percent);
+		}
+
+		// Started only after DeviceConnected, so a failure on the first write cannot be reported as a
+		// disconnect before the connect.
+		Raise(DeviceConnected, device);
+		device.Start();
+		_ = LogConnectedAsync(device, record);
+	}
+
+	// The device serial is the identity Macro Deck keeps the user's setup under, so it must be known
+	// before DeviceConnected. The USB serial string comes first, then the protocol's serial report.
+	private (string Serial, string SerialTail) ResolveIdentity(HidDeviceInfo info, StreamDeckModel model, IHidConnection connection)
+	{
+		if (!string.IsNullOrEmpty(info.SerialNumber))
+		{
+			return (info.SerialNumber, SerialMask.Tail(info.SerialNumber));
+		}
+
+		try
+		{
+			var serial = StreamDeckDevice.ReadSerialNumber(model, connection);
+			return (serial, SerialMask.Tail(serial));
+		}
+		catch (Exception ex) when (!Failures.IsFatal(ex))
+		{
+			var fallback = FallbackIdentity(model, info);
+			_logger.Warning(
+				"{Model:l} reported no serial number, neither in its USB descriptor nor in its serial feature report ({Error:l}). It is identified by its USB port instead "
+				+ "and will appear as a new device after it is plugged into another port. Please open an issue at " + StreamDeckSupport.IssuesUrl + " and attach the diagnostics snapshot.",
+				model.Name,
+				ex.Message);
+			return (fallback, SerialMask.Tail(null));
+		}
+	}
+
+	private async Task ApplyBrightnessAsync(StreamDeckDevice device, int percent)
+	{
+		try
+		{
+			await device.SetBrightnessAsync(percent).ConfigureAwait(false);
+		}
+		catch (Exception ex) when (!Failures.IsFatal(ex))
+		{
+			// The device already logged a refused report, and an ended device is reported as disconnected.
+			_logger.Debug("Could not restore brightness {Percent} on {Model:l}: {Error:l}", percent, device.Model.Name, ex.Message);
+		}
+	}
+
+	// One-shot and re-armed after each refresh, so it runs only while an open failure exists.
+	private void UpdateRetryTimer()
+	{
+		lock (_stateLock)
+		{
+			if (_disposed || _openFailing.Count == 0)
+			{
+				StopRetryTimer();
+				return;
+			}
+
+			if (_retryTimer is not null)
+			{
+				return;
+			}
+
+			var token = new object();
+			_retryTimerToken = token;
+			_retryTimer = _timeProvider.CreateTimer(OnRetryTimer, token, _openRetryInterval, Timeout.InfiniteTimeSpan);
+		}
+	}
+
+	private void OnRetryTimer(object? token)
+	{
+		lock (_stateLock)
+		{
+			// A late callback of a timer that was already replaced or stopped.
+			if (!ReferenceEquals(token, _retryTimerToken))
+			{
+				return;
+			}
+
+			StopRetryTimer();
+		}
+
+		_ = RefreshObservedAsync();
+	}
+
+	private void StopRetryTimer()
+	{
+		_retryTimer?.Dispose();
+		_retryTimer = null;
+		_retryTimerToken = null;
 	}
 
 	private async Task LogConnectedAsync(StreamDeckDevice device, DeviceRecord record)
@@ -387,11 +628,11 @@ public sealed class StreamDeckDeviceManager : IAsyncDisposable
 			info.FeatureReportLength);
 	}
 
-	private DeviceRecord GetRecord(string serial, StreamDeckModel model, HidDeviceInfo info)
+	private DeviceRecord GetRecord(string serial, string serialTail, StreamDeckModel model, HidDeviceInfo info)
 	{
 		if (!_records.TryGetValue(serial, out var record))
 		{
-			record = new DeviceRecord(model, info, SerialMask.Tail(string.IsNullOrEmpty(info.SerialNumber) ? null : info.SerialNumber));
+			record = new DeviceRecord(model, info, serialTail);
 			_records[serial] = record;
 		}
 
@@ -426,7 +667,17 @@ public sealed class StreamDeckDeviceManager : IAsyncDisposable
 
 		Raise(DeviceDisconnected, device);
 		// Disposal waits for the device threads and this runs on one of them.
-		_ = Task.Run(() => device.DisposeAsync().AsTask());
+		_ = Task.Run(async () =>
+		{
+			try
+			{
+				await device.DisposeAsync().ConfigureAwait(false);
+			}
+			catch (Exception ex) when (!Failures.IsFatal(ex))
+			{
+				_logger.Debug("Closing the failed {Model:l} threw: {Error:l}", device.Model.Name, ex.Message);
+			}
+		});
 	}
 
 	private static void Raise<T>(Action<T>? handler, T value)
