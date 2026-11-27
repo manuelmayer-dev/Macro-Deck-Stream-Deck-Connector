@@ -58,7 +58,7 @@ The plugin also needs `libudev`, which every desktop distribution installs.
 Only the Stream Deck MK.2 was tested on real hardware. Every other model is implemented from the
 publicly documented USB protocol and should work, but nobody has confirmed it. Macro Deck shows a
 note on the integration page while an untested model is connected. If yours misbehaves, please
-[open an issue](https://github.com/manuelmayer-dev/MacroDeckStreamDeckPlugin/issues).
+[open an issue](https://github.com/manuelmayer-dev/Macro-Deck-Stream-Deck-Connector/issues).
 
 | Model | Keys | Tested on hardware |
 | --- | --- | --- |
@@ -101,7 +101,7 @@ happen on a model that was never tested. Please report it.
 1. Add the action "Write Stream Deck diagnostics to the log" to a button and press it, or press
    "Write diagnostics to the log" on one of the plugin's issues on its integration page.
 2. Copy the block that starts with "Stream Deck diagnostics" from the Macro Deck log.
-3. [Open an issue](https://github.com/manuelmayer-dev/MacroDeckStreamDeckPlugin/issues/new) and paste
+3. [Open an issue](https://github.com/manuelmayer-dev/Macro-Deck-Stream-Deck-Connector/issues/new) and paste
    it, together with what you expected and what happened. A photo of the device helps for picture
    problems.
 

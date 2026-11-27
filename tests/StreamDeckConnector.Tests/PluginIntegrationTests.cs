@@ -474,7 +474,7 @@ public sealed class IssueTests
 		{
 			Assert.That(issue.Id, Does.StartWith("unsupported-"));
 			Assert.That(issue.Severity, Is.EqualTo(IntegrationIssueSeverity.Warning));
-			Assert.That(issue.HelpUrl, Is.EqualTo(new Uri("https://github.com/manuelmayer-dev/MacroDeckStreamDeckPlugin/issues/new")));
+			Assert.That(issue.HelpUrl, Is.EqualTo(new Uri("https://github.com/manuelmayer-dev/Macro-Deck-Stream-Deck-Connector/issues/new")));
 			Assert.That(resolution.Success, Is.True);
 			Assert.That(fixture.Sink.Messages(LogEventLevel.Information).Any(m => m.Contains("product 0x00AA", StringComparison.Ordinal) && m.Contains("Stream Deck diagnostics", StringComparison.Ordinal)), Is.True);
 			Assert.That(fixture.Sink.Messages(LogEventLevel.Information).Any(m => m.Contains("ST-1", StringComparison.Ordinal)), Is.False);

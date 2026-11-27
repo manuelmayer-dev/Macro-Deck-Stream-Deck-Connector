@@ -6,8 +6,8 @@ namespace StreamDeckConnector.Devices;
 
 public static class StreamDeckSupport
 {
-	public const string IssuesUrl = "https://github.com/manuelmayer-dev/MacroDeckStreamDeckPlugin/issues";
-	public const string ReadmeUrl = "https://github.com/manuelmayer-dev/MacroDeckStreamDeckPlugin#troubleshooting";
+	public const string IssuesUrl = "https://github.com/manuelmayer-dev/Macro-Deck-Stream-Deck-Connector/issues";
+	public const string ReadmeUrl = "https://github.com/manuelmayer-dev/Macro-Deck-Stream-Deck-Connector#troubleshooting";
 }
 
 /// <summary>Switched at runtime by the integration. The raw trace is off by default.</summary>
