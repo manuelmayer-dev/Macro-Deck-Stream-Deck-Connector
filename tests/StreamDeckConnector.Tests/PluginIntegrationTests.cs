@@ -221,6 +221,22 @@ public sealed class DeviceProviderTests
 	}
 
 	[Test]
+	public async Task Only_keys_macro_deck_did_not_push_are_fetched()
+	{
+		await using var fixture = await Fixture.CreateAsync(Fixture.Mk2());
+		await fixture.StartProvidersAsync();
+		var session = fixture.NewSession(_mk2Format);
+		Fixture.SeedAllKeys(session, rows: 3, columns: 5, revision: 1);
+
+		await fixture.Integration.OnSessionOpenedAsync(session);
+		session.PushKeyImage(Fixture.Picture(0, 0, revision: 2, fill: 0x7F));
+		await Fixture.EventuallyAsync(() => fixture.PaintedKeys("mk2").Count == 15);
+
+		Assert.That(session.KeyImageRequests, Has.Count.EqualTo(14));
+		Assert.That(session.KeyImageRequests, Has.None.EqualTo((0, 0)));
+	}
+
+	[Test]
 	public async Task A_changed_key_picture_is_written_and_a_stale_one_is_dropped()
 	{
 		await using var fixture = await Fixture.CreateAsync(Fixture.Mk2());
@@ -325,6 +341,98 @@ public sealed class DeviceProviderTests
 		await ((IDeviceProvider)fixture.Integration).ShutdownAsync();
 
 		Assert.That(fixture.Connection("mk2").Writes.Any(w => w.Kind == WriteKind.SetFeature && w.Bytes[0] == 0x03 && w.Bytes[1] == 0x02), Is.True);
+	}
+}
+
+[TestFixture]
+public sealed class InteractionDeliveryTests
+{
+	[Test]
+	public async Task A_refused_release_is_repeated_until_macro_deck_takes_it()
+	{
+		await using var fixture = await Fixture.CreateAsync(Fixture.Mk2());
+		await fixture.StartProvidersAsync();
+		var session = new RefusingSession { Refusals = { [DeviceInteractionKind.Release] = 3 } };
+		await using var bridge = fixture.NewBridge(session);
+
+		fixture.Connection("mk2").EnqueueInput(Fixture.Gen2Keys(15, pressed: 0));
+		fixture.Connection("mk2").EnqueueInput(Fixture.Gen2Keys(15));
+		await Fixture.EventuallyAsync(() => session.Delivered.Count == 2);
+
+		Assert.That(session.Delivered, Is.EqualTo((DeviceInteractionKind[])[DeviceInteractionKind.Press, DeviceInteractionKind.Release]));
+		Assert.That(bridge.InteractionsLost, Is.Zero);
+	}
+
+	[Test]
+	public async Task A_press_that_stays_refused_is_dropped_together_with_its_release()
+	{
+		await using var fixture = await Fixture.CreateAsync(Fixture.Mk2());
+		await fixture.StartProvidersAsync();
+		var session = new RefusingSession { Refusals = { [DeviceInteractionKind.Press] = 6 } };
+		await using var bridge = fixture.NewBridge(session);
+
+		fixture.Connection("mk2").EnqueueInput(Fixture.Gen2Keys(15, pressed: 0));
+		fixture.Connection("mk2").EnqueueInput(Fixture.Gen2Keys(15));
+		await Fixture.EventuallyAsync(() => bridge.InteractionsLost == 1);
+		fixture.Connection("mk2").EnqueueInput(Fixture.Gen2Keys(15, pressed: 0));
+		fixture.Connection("mk2").EnqueueInput(Fixture.Gen2Keys(15));
+		await Fixture.EventuallyAsync(() => session.Delivered.Count == 2);
+
+		Assert.That(session.Delivered, Is.EqualTo((DeviceInteractionKind[])[DeviceInteractionKind.Press, DeviceInteractionKind.Release]));
+		Assert.That(bridge.InteractionsLost, Is.EqualTo(1));
+	}
+
+	private sealed class RefusingSession : IDeviceSession
+	{
+		private readonly object _lock = new();
+		private readonly List<DeviceInteractionKind> _delivered = [];
+
+		public Dictionary<DeviceInteractionKind, int> Refusals { get; } = [];
+
+		public IReadOnlyList<DeviceInteractionKind> Delivered
+		{
+			get
+			{
+				lock (_lock)
+				{
+					return [.. _delivered];
+				}
+			}
+		}
+
+		public string DeviceId => "device";
+
+		public string ProviderDeviceId => "SN-1";
+
+		public DeviceSurface CurrentSurface { get; } = Fixture.Surface(
+			revision: 2,
+			Fixture.Widget("w-0", column: 0, row: 0, DeviceInteractionKind.Press, DeviceInteractionKind.Release));
+
+#pragma warning disable CS0067 // The bridge subscribes, this stub never raises them.
+		public event EventHandler<DeviceSurfaceChangedEventArgs>? SurfaceChanged;
+
+		public event EventHandler<DeviceSessionClosedEventArgs>? Closed;
+#pragma warning restore CS0067
+
+		public Task<DeviceInteractionResult> SendInteractionAsync(DeviceInteraction interaction, CancellationToken cancellationToken = default)
+		{
+			lock (_lock)
+			{
+				if (Refusals.TryGetValue(interaction.Kind, out var left) && left > 0)
+				{
+					Refusals[interaction.Kind] = left - 1;
+					return Task.FromException<DeviceInteractionResult>(new TimeoutException("refused"));
+				}
+
+				_delivered.Add(interaction.Kind);
+				return Task.FromResult(DeviceInteractionResult.Accepted);
+			}
+		}
+
+		public Task<DeviceIconImage?> GetIconAsync(string iconId, int? size = null, string? knownETag = null, CancellationToken cancellationToken = default) =>
+			Task.FromResult<DeviceIconImage?>(null);
+
+		public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 	}
 }
 
@@ -535,6 +643,16 @@ internal sealed class Fixture : IAsyncDisposable
 
 	public FakeDeviceSession NewSession(LayoutKeyImageFormat? format) =>
 		new(Devices.AssignedIdOf("SN-1") ?? "device", "SN-1", Devices) { KeyImageFormat = format };
+
+	/// <summary>A second bridge on the first attached device, with a session the test controls.</summary>
+	public DeviceBridge NewBridge(IDeviceSession session)
+	{
+		var device = _manager.Devices[0];
+		var bridge = new DeviceBridge(device.SerialNumber, device.Model, Serilog.Core.Logger.None, TimeSpan.Zero, ex => ex is TimeoutException);
+		bridge.AttachDevice(device);
+		bridge.OpenSession(session);
+		return bridge;
+	}
 
 	public FakeHidConnection Connection(string path) => Source.Connections[path];
 

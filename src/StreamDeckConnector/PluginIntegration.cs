@@ -19,6 +19,7 @@ namespace StreamDeckConnector;
 public sealed class PluginIntegration : IPluginIntegration, ILayoutProvider, IDeviceProvider, IIntegrationIssueProvider, IAsyncDisposable
 {
 	private const string Manufacturer = "Elgato";
+	private const int MaxLogMessageLength = 3000;
 	private const string HidUnavailableIssue = "hid-unavailable";
 	private const string HostTooOldIssue = "host-renders-no-key-images";
 	private const string OpenFailedIssue = "device-open-failed";
@@ -29,7 +30,6 @@ public sealed class PluginIntegration : IPluginIntegration, ILayoutProvider, IDe
 
 	private readonly ILogger _logger;
 	private readonly StreamDeckDeviceManager _manager;
-	private readonly StreamDeckDiagnosticsOptions _diagnostics;
 	private readonly ConcurrentDictionary<string, DeviceBridge> _bridges = new(StringComparer.Ordinal);
 	private readonly ConcurrentDictionary<string, string> _layoutIds = new(StringComparer.Ordinal);
 	private readonly ConcurrentDictionary<string, StreamDeckDevice> _registered = new(StringComparer.Ordinal);
@@ -44,7 +44,6 @@ public sealed class PluginIntegration : IPluginIntegration, ILayoutProvider, IDe
 	{
 		_logger = logger.ForContext<PluginIntegration>();
 		_manager = manager;
-		_diagnostics = diagnostics;
 		Actions =
 		[
 			new SetBrightnessAction(manager),
@@ -110,7 +109,7 @@ public sealed class PluginIntegration : IPluginIntegration, ILayoutProvider, IDe
 		await Task.WhenAll(_bridges.Values.Select(bridge => bridge.ShowLogoAsync(timeout.Token))).ConfigureAwait(false);
 	}
 
-	public IReadOnlyList<DeviceDescriptor> GetDevices() => [.. _manager.Devices.Select(Describe)];
+	public IReadOnlyList<DeviceDescriptor> GetDevices() => [.. _registered.Values.Select(Describe)];
 
 	public Task OnSessionOpenedAsync(IDeviceSession session, CancellationToken cancellationToken = default)
 	{
@@ -127,7 +126,8 @@ public sealed class PluginIntegration : IPluginIntegration, ILayoutProvider, IDe
 				bridge.Model.Name);
 		}
 
-		return bridge.OpenSessionAsync(session);
+		bridge.OpenSession(session);
+		return Task.CompletedTask;
 	}
 
 	public Task<IReadOnlyList<IntegrationIssue>> GetIssuesAsync(CancellationToken cancellationToken = default)
@@ -201,18 +201,23 @@ public sealed class PluginIntegration : IPluginIntegration, ILayoutProvider, IDe
 		return Task.FromResult<IReadOnlyList<IntegrationIssue>>(issues);
 	}
 
-	public Task<IssueResolution> ResolveIssueAsync(string issueId, CancellationToken cancellationToken = default)
+	public async Task<IssueResolution> ResolveIssueAsync(string issueId, CancellationToken cancellationToken = default)
 	{
 		var writesDiagnostics = issueId == OpenFailedIssue
 			|| issueId.StartsWith(UnsupportedIssuePrefix, StringComparison.Ordinal)
 			|| issueId.StartsWith(UntestedIssuePrefix, StringComparison.Ordinal);
 		if (!writesDiagnostics)
 		{
-			return Task.FromResult(IssueResolution.Failed(Strings.Issues.NothingToDo()));
+			return IssueResolution.Failed(Strings.Issues.NothingToDo());
+		}
+
+		if (issueId == OpenFailedIssue)
+		{
+			await _manager.RefreshAsync().ConfigureAwait(false);
 		}
 
 		WriteDiagnosticsToLog();
-		return Task.FromResult(IssueResolution.Ok(Strings.Issues.DiagnosticsWritten()));
+		return IssueResolution.Ok(Strings.Issues.DiagnosticsWritten());
 	}
 
 	public async ValueTask DisposeAsync()
@@ -228,7 +233,23 @@ public sealed class PluginIntegration : IPluginIntegration, ILayoutProvider, IDe
 		_registrationGate.Dispose();
 	}
 
-	public void WriteDiagnosticsToLog() => _logger.Information("{Diagnostics:l}", DescribeDiagnostics());
+	/// <summary>Written in parts because Macro Deck caps the length of one log message.</summary>
+	public void WriteDiagnosticsToLog()
+	{
+		var part = new StringBuilder();
+		foreach (var line in DescribeDiagnostics().Split('\n'))
+		{
+			if (part.Length > 0 && part.Length + line.Length > MaxLogMessageLength)
+			{
+				_logger.Information("{Diagnostics:l}", part.ToString().TrimEnd());
+				part.Clear().Append("Stream Deck diagnostics, continued").Append('\n');
+			}
+
+			part.Append(line).Append('\n');
+		}
+
+		_logger.Information("{Diagnostics:l}", part.ToString().TrimEnd());
+	}
 
 	/// <summary>A plain text snapshot a user can paste into an issue. Serial numbers are masked.</summary>
 	public string DescribeDiagnostics()
@@ -236,11 +257,11 @@ public sealed class PluginIntegration : IPluginIntegration, ILayoutProvider, IDe
 		var text = new StringBuilder(_manager.DescribeDiagnostics());
 		text.AppendLine();
 		text.AppendLine(CultureInfo.InvariantCulture, $"HID access: {_hidFailure ?? "working"}");
-		text.AppendLine(CultureInfo.InvariantCulture, $"Macro Deck sessions: {_bridges.Count}");
+		text.AppendLine(CultureInfo.InvariantCulture, $"Devices known to this run: {_bridges.Count}, with an open Macro Deck session: {_bridges.Values.Count(bridge => bridge.HasSession)}");
 		foreach (var bridge in _bridges.Values)
 		{
 			var pictures = bridge.HostSendsNoPictures ? "host sends no key pictures" : "key pictures from host";
-			text.AppendLine(CultureInfo.InvariantCulture, $"- {bridge.Model.Name} | serial ending {SerialMask.Tail(bridge.SerialNumber)} | session {(bridge.HasSession ? "open" : "closed")} | {pictures} | interactions sent {bridge.InteractionsSent} | last interaction problem: {bridge.LastInteractionProblem ?? "none"}");
+			text.AppendLine(CultureInfo.InvariantCulture, $"- {bridge.Model.Name} | serial ending {SerialMask.Tail(bridge.SerialNumber)} | session {(bridge.HasSession ? "open" : "closed")} | {pictures} | interactions sent {bridge.InteractionsSent}, lost {bridge.InteractionsLost} | last interaction problem: {bridge.LastInteractionProblem ?? "none"}");
 		}
 
 		return text.ToString();
@@ -279,8 +300,7 @@ public sealed class PluginIntegration : IPluginIntegration, ILayoutProvider, IDe
 
 	private void OnDeviceConnected(StreamDeckDevice device)
 	{
-		var bridge = _bridges.GetOrAdd(device.SerialNumber, serial => new DeviceBridge(serial, device.Model, _logger));
-		bridge.AttachDevice(device);
+		BridgeFor(device).AttachDevice(device);
 		if (!device.IsHardwareVerified)
 		{
 			_logger.Information(
@@ -301,7 +321,29 @@ public sealed class PluginIntegration : IPluginIntegration, ILayoutProvider, IDe
 
 		_registered.TryRemove(new KeyValuePair<string, StreamDeckDevice>(device.SerialNumber, device));
 
-		_ = ReportOfflineAsync(device);
+		// Another interface or a quick replug may already be live under the same id.
+		if (!_manager.Devices.Any(other => other.SerialNumber == device.SerialNumber))
+		{
+			_ = ReportOfflineAsync(device);
+		}
+	}
+
+	private DeviceBridge BridgeFor(StreamDeckDevice device)
+	{
+		while (true)
+		{
+			var bridge = _bridges.GetOrAdd(device.SerialNumber, serial => new DeviceBridge(serial, device.Model, _logger));
+			if (bridge.Model == device.Model)
+			{
+				return bridge;
+			}
+
+			// The id now belongs to another model, so the old bridge's key grid no longer fits.
+			if (_bridges.TryRemove(new KeyValuePair<string, DeviceBridge>(device.SerialNumber, bridge)))
+			{
+				_ = bridge.DisposeAsync().AsTask();
+			}
+		}
 	}
 
 	// Only the layouts of models that are actually attached are registered: every registration is a

@@ -7,11 +7,15 @@ namespace StreamDeckConnector;
 
 /// <summary>
 /// Joins one physical device to its host session. Either side can come and go on its own: the device
-/// on a replug, the session on a host reconnect. Whenever both are present every key is painted from
-/// the host's current pictures.
+/// on a replug, the session on a host reconnect. Macro Deck pushes every key picture after a session
+/// opens and after a device comes back online. Keys that still show nothing a moment later are fetched.
 /// </summary>
 public sealed class DeviceBridge : IAsyncDisposable
 {
+	private const int PressAttempts = 6;
+	private const int ReleaseAttempts = 50;
+	private static readonly TimeSpan _interactionRetryDelay = TimeSpan.FromMilliseconds(100);
+
 	private readonly ILogger _logger;
 	private readonly object _gate = new();
 	private readonly Dictionary<int, string> _pressedWidgets = [];
@@ -20,13 +24,21 @@ public sealed class DeviceBridge : IAsyncDisposable
 	private readonly Task _sender;
 	private StreamDeckDevice? _device;
 	private IDeviceSession? _session;
+	private readonly HashSet<string> _lostPresses = new(StringComparer.Ordinal);
+	private readonly Func<Exception, bool> _isRetryable;
+	private readonly TimeSpan _fetchMissingAfter;
 	private long[] _appliedRevisions = [];
 	private int _rejectedPictures;
+	private long _interactionsSent;
+	private long _interactionsLost;
+	private volatile string? _lastInteractionProblem;
 
-	public DeviceBridge(string serialNumber, StreamDeckModel model, ILogger logger)
+	public DeviceBridge(string serialNumber, StreamDeckModel model, ILogger logger, TimeSpan? fetchMissingAfter = null, Func<Exception, bool>? isRetryable = null)
 	{
 		SerialNumber = serialNumber;
 		Model = model;
+		_fetchMissingAfter = fetchMissingAfter ?? TimeSpan.FromMilliseconds(400);
+		_isRetryable = isRetryable ?? HostCalls.IsRetryable;
 		_logger = logger.ForContext<DeviceBridge>();
 		_sender = Task.Run(SendInteractionsAsync);
 	}
@@ -58,9 +70,11 @@ public sealed class DeviceBridge : IAsyncDisposable
 		}
 	}
 
-	public long InteractionsSent { get; private set; }
+	public long InteractionsSent => Interlocked.Read(ref _interactionsSent);
 
-	public string? LastInteractionProblem { get; private set; }
+	public long InteractionsLost => Interlocked.Read(ref _interactionsLost);
+
+	public string? LastInteractionProblem => _lastInteractionProblem;
 
 	public void AttachDevice(StreamDeckDevice device)
 	{
@@ -77,7 +91,7 @@ public sealed class DeviceBridge : IAsyncDisposable
 
 		if (session is not null)
 		{
-			_ = PaintAllAsync(session, device);
+			_ = FetchMissingAsync(session, device);
 		}
 	}
 
@@ -92,7 +106,8 @@ public sealed class DeviceBridge : IAsyncDisposable
 		}
 	}
 
-	public Task OpenSessionAsync(IDeviceSession session)
+	/// <summary>Returns at once: Macro Deck sends the first surface only after the provider's open handler returned.</summary>
+	public void OpenSession(IDeviceSession session)
 	{
 		StreamDeckDevice? device;
 		lock (_gate)
@@ -105,7 +120,10 @@ public sealed class DeviceBridge : IAsyncDisposable
 			device = _device;
 		}
 
-		return device is null ? Task.CompletedTask : PaintAllAsync(session, device);
+		if (device is not null)
+		{
+			_ = FetchMissingAsync(session, device);
+		}
 	}
 
 	public async Task ShowLogoAsync(CancellationToken cancellationToken)
@@ -188,7 +206,7 @@ public sealed class DeviceBridge : IAsyncDisposable
 
 	private void OnKeyImageChanged(object? sender, DeviceKeyImageChangedEventArgs e) => Apply(sender as IDeviceSession, e.Image);
 
-	private async Task PaintAllAsync(IDeviceSession session, StreamDeckDevice device)
+	private async Task FetchMissingAsync(IDeviceSession session, StreamDeckDevice device)
 	{
 		if (!Model.HasKeyImages || session.KeyImageFormat is null)
 		{
@@ -197,14 +215,14 @@ public sealed class DeviceBridge : IAsyncDisposable
 
 		try
 		{
-			// One cell after the other, each applied as it arrives, so a refused call costs one key and not all.
+			await Task.Delay(_fetchMissingAfter).ConfigureAwait(false);
 			for (var row = 0; row < Model.Rows; row++)
 			{
 				for (var column = 0; column < Model.Columns; column++)
 				{
-					if (!IsCurrent(session, device))
+					if (!IsMissing(session, device, (row * Model.Columns) + column))
 					{
-						return;
+						continue;
 					}
 
 					var (cellRow, cellColumn) = (row, column);
@@ -219,46 +237,39 @@ public sealed class DeviceBridge : IAsyncDisposable
 		catch (Exception ex) when (ex is not OutOfMemoryException)
 		{
 			// The session or the device may have ended meanwhile. The next open or attach paints again.
-			_logger.Warning("Could not paint every key of {Model:l}: {Error:l}", Model.Name, ex.Message);
+			_logger.Warning("Could not fetch every key picture of {Model:l}: {Error:l}", Model.Name, ex.Message);
 		}
 	}
 
-	private bool IsCurrent(IDeviceSession session, StreamDeckDevice device)
+	private bool IsMissing(IDeviceSession session, StreamDeckDevice device, int key)
 	{
 		lock (_gate)
 		{
-			return ReferenceEquals(_session, session) && ReferenceEquals(_device, device);
+			return ReferenceEquals(_session, session) && ReferenceEquals(_device, device) && _appliedRevisions[key] == 0;
 		}
 	}
 
 	private void Apply(IDeviceSession? source, DeviceKeyImage image)
 	{
-		StreamDeckDevice? device;
-		var key = (image.Row * Model.Columns) + image.Column;
-		lock (_gate)
+		if (image.Row < 0 || image.Row >= Model.Rows || image.Column < 0 || image.Column >= Model.Columns)
 		{
-			device = _device;
-			if (device is null || !ReferenceEquals(source, _session))
-			{
-				return;
-			}
-
-			if (image.Row < 0 || image.Row >= Model.Rows || image.Column < 0 || image.Column >= Model.Columns)
-			{
-				return;
-			}
-
-			if (image.Revision <= _appliedRevisions[key])
-			{
-				return;
-			}
-
-			_appliedRevisions[key] = image.Revision;
+			return;
 		}
 
+		var key = (image.Row * Model.Columns) + image.Column;
 		try
 		{
-			device.SetKeyImage(key, image.Content);
+			// Enqueued under the lock so a fetched and a pushed picture for one key cannot swap places.
+			lock (_gate)
+			{
+				if (_device is null || !ReferenceEquals(source, _session) || image.Revision <= _appliedRevisions[key])
+				{
+					return;
+				}
+
+				_appliedRevisions[key] = image.Revision;
+				_device.SetKeyImage(key, image.Content);
+			}
 		}
 		catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or NotSupportedException or ObjectDisposedException)
 		{
@@ -349,25 +360,42 @@ public sealed class DeviceBridge : IAsyncDisposable
 	{
 		await foreach (var pending in _interactions.Reader.ReadAllAsync().ConfigureAwait(false))
 		{
+			var kind = pending.Interaction.Kind;
+			var widgetId = pending.Interaction.Target.WidgetId ?? string.Empty;
+			if (kind == DeviceInteractionKind.Release && _lostPresses.Remove(widgetId))
+			{
+				continue;
+			}
+
 			try
 			{
-				var result = await pending.Session.SendInteractionAsync(pending.Interaction).ConfigureAwait(false);
-				InteractionsSent++;
+				// A refused release would leave the widget held on the host, so it is repeated until taken.
+				// A press that is still refused after a moment is stale and is dropped with its release.
+				var attempts = kind == DeviceInteractionKind.Release ? ReleaseAttempts : PressAttempts;
+				var result = await HostCalls.RetryAsync(
+					() => pending.Session.SendInteractionAsync(pending.Interaction),
+					_isRetryable,
+					_interactionRetryDelay,
+					attempts).ConfigureAwait(false);
+				Interlocked.Increment(ref _interactionsSent);
 				if (result.Status != DeviceInteractionStatus.Accepted)
 				{
-					LastInteractionProblem = $"{pending.Interaction.Kind} answered {result.Status} {result.ReasonCode}";
-					_logger.Debug(
-						"{Kind} on {Model:l} was answered {Status} {Reason:l}",
-						pending.Interaction.Kind,
-						Model.Name,
-						result.Status,
-						result.ReasonCode);
+					_lastInteractionProblem = $"{kind} answered {result.Status} {result.ReasonCode}";
+					_logger.Debug("{Kind} on {Model:l} was answered {Status} {Reason:l}", kind, Model.Name, result.Status, result.ReasonCode);
 				}
 			}
 			catch (Exception ex) when (ex is not OutOfMemoryException)
 			{
-				LastInteractionProblem = $"{pending.Interaction.Kind} failed: {ex.Message}";
-				_logger.Debug("{Kind} on {Model:l} could not be sent: {Error:l}", pending.Interaction.Kind, Model.Name, ex.Message);
+				if (kind == DeviceInteractionKind.Press)
+				{
+					_lostPresses.Add(widgetId);
+				}
+
+				_lastInteractionProblem = $"{kind} failed: {ex.Message}";
+				if (Interlocked.Increment(ref _interactionsLost) == 1)
+				{
+					_logger.Warning("A key {Kind} on {Model:l} could not be sent to Macro Deck: {Error:l}. Further losses are counted in the diagnostics.", kind, Model.Name, ex.Message);
+				}
 			}
 		}
 	}
