@@ -197,27 +197,37 @@ public sealed class DeviceBridge : IAsyncDisposable
 
 		try
 		{
-			var fetches = new List<Task<DeviceKeyImage?>>(Model.KeyCount);
+			// One cell after the other, each applied as it arrives, so a refused call costs one key and not all.
 			for (var row = 0; row < Model.Rows; row++)
 			{
 				for (var column = 0; column < Model.Columns; column++)
 				{
-					fetches.Add(session.GetKeyImageAsync(row, column));
-				}
-			}
+					if (!IsCurrent(session, device))
+					{
+						return;
+					}
 
-			foreach (var image in await Task.WhenAll(fetches).ConfigureAwait(false))
-			{
-				if (image is not null)
-				{
-					Apply(session, image);
+					var (cellRow, cellColumn) = (row, column);
+					var image = await HostCalls.RetryAsync(() => session.GetKeyImageAsync(cellRow, cellColumn)).ConfigureAwait(false);
+					if (image is not null)
+					{
+						Apply(session, image);
+					}
 				}
 			}
 		}
 		catch (Exception ex) when (ex is not OutOfMemoryException)
 		{
 			// The session or the device may have ended meanwhile. The next open or attach paints again.
-			_logger.Warning("Could not paint the keys of {Model:l}: {Error:l}", Model.Name, ex.Message);
+			_logger.Warning("Could not paint every key of {Model:l}: {Error:l}", Model.Name, ex.Message);
+		}
+	}
+
+	private bool IsCurrent(IDeviceSession session, StreamDeckDevice device)
+	{
+		lock (_gate)
+		{
+			return ReferenceEquals(_session, session) && ReferenceEquals(_device, device);
 		}
 	}
 

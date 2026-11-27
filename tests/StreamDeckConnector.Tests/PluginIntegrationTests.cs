@@ -62,14 +62,73 @@ public sealed class PluginHarnessTests
 public sealed class LayoutTests
 {
 	[Test]
-	public async Task Every_model_registers_one_layout_under_a_unique_id()
+	public void Every_model_has_a_layout_under_a_unique_id()
 	{
-		var context = new FakeLayoutProviderContext();
+		Assert.That(StreamDeckLayouts.All.Select(layout => layout.Id).Distinct().Count(), Is.EqualTo(StreamDeckModels.All.Count));
+	}
+
+	[Test]
+	public async Task Only_the_layouts_of_attached_models_are_registered()
+	{
+		await using var fixture = await Fixture.CreateAsync(Fixture.Mk2());
+
+		await fixture.StartProvidersAsync();
+
+		Assert.That(fixture.Layouts.Layouts.Keys, Is.EqualTo((string[])["deck-0fd9-0080"]));
+		Assert.That(((MacroDeck.Sdk.Layouts.ILayoutProvider)fixture.Integration).GetLayouts().Select(layout => layout.Id), Is.EqualTo((string[])["deck-0fd9-0080"]));
+	}
+
+	[Test]
+	public async Task A_model_attached_later_registers_its_layout_before_the_device()
+	{
 		await using var fixture = await Fixture.CreateAsync();
+		await fixture.StartProvidersAsync();
 
-		await fixture.Integration.InitializeAsync(context);
+		fixture.Source.Plug(new HidDeviceInfo("xl", 0x0FD9, 0x006C, "XL-1"));
+		fixture.Source.RaiseChanged();
+		await Fixture.EventuallyAsync(() => fixture.Devices.Devices.ContainsKey("XL-1"));
 
-		Assert.That(context.Layouts, Has.Count.EqualTo(StreamDeckModels.All.Count));
+		Assert.That(fixture.Devices.Devices["XL-1"].LayoutReference, Is.EqualTo("deck-0fd9-006c"));
+		Assert.That(fixture.Layouts.Layouts.Keys, Is.EqualTo((string[])["deck-0fd9-006c"]));
+	}
+
+	[Test]
+	public async Task A_deck_is_registered_exactly_once_per_provider_start()
+	{
+		await using var fixture = await Fixture.CreateAsync(Fixture.Mk2());
+
+		await fixture.StartProvidersAsync();
+
+		Assert.That(fixture.Devices.Calls.Count(call => call.Kind == DeviceProviderCallKind.Register), Is.EqualTo(1));
+	}
+
+	[Test]
+	public async Task A_refused_host_call_is_repeated_until_it_is_taken()
+	{
+		var attempts = 0;
+
+		var result = await HostCalls.RetryAsync(
+			() => ++attempts < 3 ? Task.FromException<int>(new TimeoutException()) : Task.FromResult(7),
+			ex => ex is TimeoutException,
+			TimeSpan.Zero);
+
+		Assert.That((result, attempts), Is.EqualTo((7, 3)));
+	}
+
+	[Test]
+	public void A_host_call_that_fails_for_another_reason_is_not_repeated()
+	{
+		var attempts = 0;
+
+		Assert.ThrowsAsync<InvalidOperationException>(() => HostCalls.RetryAsync(
+			() =>
+			{
+				attempts++;
+				return Task.FromException<int>(new InvalidOperationException());
+			},
+			ex => ex is TimeoutException,
+			TimeSpan.Zero));
+		Assert.That(attempts, Is.EqualTo(1));
 	}
 
 	[Test]
@@ -483,5 +542,9 @@ internal sealed class Fixture : IAsyncDisposable
 	public IReadOnlyList<int> PaintedKeys(string path) =>
 		[.. Connection(path).Writes.Where(w => w.Kind == WriteKind.Output && w.Bytes[0] == 0x02 && w.Bytes[1] == 0x07).Select(w => (int)w.Bytes[2])];
 
-	public async ValueTask DisposeAsync() => await _manager.DisposeAsync();
+	public async ValueTask DisposeAsync()
+	{
+		await _manager.DisposeAsync();
+		await Integration.DisposeAsync();
+	}
 }

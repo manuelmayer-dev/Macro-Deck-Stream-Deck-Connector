@@ -16,7 +16,7 @@ namespace StreamDeckConnector;
 /// Offers every attached Stream Deck to Macro Deck as a device. Macro Deck draws the keys, this plugin
 /// only moves the finished pictures to the hardware and the key presses back.
 /// </summary>
-public sealed class PluginIntegration : IPluginIntegration, ILayoutProvider, IDeviceProvider, IIntegrationIssueProvider
+public sealed class PluginIntegration : IPluginIntegration, ILayoutProvider, IDeviceProvider, IIntegrationIssueProvider, IAsyncDisposable
 {
 	private const string Manufacturer = "Elgato";
 	private const string HidUnavailableIssue = "hid-unavailable";
@@ -32,8 +32,11 @@ public sealed class PluginIntegration : IPluginIntegration, ILayoutProvider, IDe
 	private readonly StreamDeckDiagnosticsOptions _diagnostics;
 	private readonly ConcurrentDictionary<string, DeviceBridge> _bridges = new(StringComparer.Ordinal);
 	private readonly ConcurrentDictionary<string, string> _layoutIds = new(StringComparer.Ordinal);
+	private readonly ConcurrentDictionary<string, StreamDeckDevice> _registered = new(StringComparer.Ordinal);
+	private readonly SemaphoreSlim _registrationGate = new(1, 1);
 	private readonly object _startGate = new();
 	private Task? _started;
+	private volatile ILayoutProviderContext? _layouts;
 	private volatile IDeviceProviderContext? _devices;
 	private volatile string? _hidFailure;
 
@@ -59,19 +62,40 @@ public sealed class PluginIntegration : IPluginIntegration, ILayoutProvider, IDe
 
 	public async Task InitializeAsync(ILayoutProviderContext context, CancellationToken cancellationToken = default)
 	{
-		foreach (var layout in StreamDeckLayouts.All)
+		await EnsureStartedAsync().ConfigureAwait(false);
+		await _registrationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+		try
 		{
-			var registration = await context.RegisterLayoutAsync(layout, cancellationToken).ConfigureAwait(false);
-			_layoutIds[layout.Id] = registration.LayoutId;
+			_layouts = context;
+			_layoutIds.Clear();
+			foreach (var model in _manager.Devices.Select(device => device.Model).Distinct())
+			{
+				await EnsureLayoutAsync(model, cancellationToken).ConfigureAwait(false);
+			}
+		}
+		finally
+		{
+			_registrationGate.Release();
 		}
 	}
 
-	public IReadOnlyList<LayoutDescriptor> GetLayouts() => StreamDeckLayouts.All;
+	public IReadOnlyList<LayoutDescriptor> GetLayouts() =>
+		[.. StreamDeckLayouts.All.Where(layout => _layoutIds.ContainsKey(layout.Id))];
 
 	public async Task InitializeAsync(IDeviceProviderContext context, CancellationToken cancellationToken = default)
 	{
-		_devices = context;
 		await EnsureStartedAsync().ConfigureAwait(false);
+		await _registrationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+		try
+		{
+			_devices = context;
+			_registered.Clear();
+		}
+		finally
+		{
+			_registrationGate.Release();
+		}
+
 		foreach (var device in _manager.Devices)
 		{
 			await RegisterAsync(device, cancellationToken).ConfigureAwait(false);
@@ -191,6 +215,19 @@ public sealed class PluginIntegration : IPluginIntegration, ILayoutProvider, IDe
 		return Task.FromResult(IssueResolution.Ok(Strings.Issues.DiagnosticsWritten()));
 	}
 
+	public async ValueTask DisposeAsync()
+	{
+		_manager.DeviceConnected -= OnDeviceConnected;
+		_manager.DeviceDisconnected -= OnDeviceDisconnected;
+		foreach (var bridge in _bridges.Values)
+		{
+			await bridge.DisposeAsync().ConfigureAwait(false);
+		}
+
+		_bridges.Clear();
+		_registrationGate.Dispose();
+	}
+
 	public void WriteDiagnosticsToLog() => _logger.Information("{Diagnostics:l}", DescribeDiagnostics());
 
 	/// <summary>A plain text snapshot a user can paste into an issue. Serial numbers are masked.</summary>
@@ -262,19 +299,49 @@ public sealed class PluginIntegration : IPluginIntegration, ILayoutProvider, IDe
 			bridge.DetachDevice(device);
 		}
 
+		_registered.TryRemove(new KeyValuePair<string, StreamDeckDevice>(device.SerialNumber, device));
+
 		_ = ReportOfflineAsync(device);
 	}
 
-	private async Task RegisterAsync(StreamDeckDevice device, CancellationToken cancellationToken)
+	// Only the layouts of models that are actually attached are registered: every registration is a
+	// host call, and the host limits how many a plugin may make in a burst.
+	private async Task EnsureLayoutAsync(StreamDeckModel model, CancellationToken cancellationToken)
 	{
-		if (_devices is not { } context)
+		var localId = StreamDeckLayouts.LocalId(model);
+		if (_layouts is not { } context || _layoutIds.ContainsKey(localId))
 		{
 			return;
 		}
 
+		var registration = await HostCalls.RetryAsync(() => context.RegisterLayoutAsync(StreamDeckLayouts.For(model), cancellationToken), cancellationToken).ConfigureAwait(false);
+		_layoutIds[localId] = registration.LayoutId;
+	}
+
+	// One registration at a time, and one per attached device: the connect event and the provider
+	// start-up both lead here and must not register the same device twice at once.
+	private async Task RegisterAsync(StreamDeckDevice device, CancellationToken cancellationToken)
+	{
 		try
 		{
-			await context.RegisterDeviceAsync(Describe(device), cancellationToken).ConfigureAwait(false);
+			await _registrationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+			try
+			{
+				if (_devices is not { } context
+					|| (_registered.TryGetValue(device.SerialNumber, out var known) && ReferenceEquals(known, device))
+					|| !_manager.Devices.Contains(device))
+				{
+					return;
+				}
+
+				await EnsureLayoutAsync(device.Model, cancellationToken).ConfigureAwait(false);
+				await HostCalls.RetryAsync(() => context.RegisterDeviceAsync(Describe(device), cancellationToken), cancellationToken).ConfigureAwait(false);
+				_registered[device.SerialNumber] = device;
+			}
+			finally
+			{
+				_registrationGate.Release();
+			}
 		}
 		catch (Exception ex) when (ex is not OutOfMemoryException)
 		{
