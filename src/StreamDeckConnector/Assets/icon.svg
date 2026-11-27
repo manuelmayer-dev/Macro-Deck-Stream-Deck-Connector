@@ -1,4 +1,14 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-	<circle cx="24" cy="23" r="12" fill="#F5A623" />
-	<path d="M18 44h27a10 10 0 0 0 1-19.9A14 14 0 0 0 19 20.6 12 12 0 0 0 18 44z" fill="#4A90D9" />
+	<rect x="4" y="10" width="56" height="44" rx="8" fill="#1F2430" />
+	<g fill="#3D4558">
+		<rect x="10" y="16" width="12" height="9" rx="2" />
+		<rect x="42" y="16" width="12" height="9" rx="2" />
+		<rect x="10" y="28" width="12" height="9" rx="2" />
+		<rect x="26" y="28" width="12" height="9" rx="2" />
+		<rect x="26" y="40" width="12" height="9" rx="2" />
+		<rect x="42" y="40" width="12" height="9" rx="2" />
+	</g>
+	<rect x="26" y="16" width="12" height="9" rx="2" fill="#4A90D9" />
+	<rect x="42" y="28" width="12" height="9" rx="2" fill="#F5A623" />
+	<rect x="10" y="40" width="12" height="9" rx="2" fill="#5CC689" />
 </svg>

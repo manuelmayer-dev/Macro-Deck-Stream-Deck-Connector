@@ -35,6 +35,11 @@
   "license": "MIT",
   "repository": "https://github.com/manuelmayer-dev/MacroDeckStreamDeckPlugin",
   "permissions": ["host:devices", "host:layouts", "device:usb"],
+  "ai": {
+    "interaction": false,
+    "generatedContent": false,
+    "generatedAssets": true
+  },
   "compatibility": {
     "macroDeck": ">=3.0.0-0"
   }
