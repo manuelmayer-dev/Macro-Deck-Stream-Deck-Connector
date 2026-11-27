@@ -52,7 +52,8 @@ public static class StreamDeckLayouts
 		TextLabels = model.HasKeyImages,
 		Transparency = model.HasKeyImages,
 		WidgetSpacing = false,
-		CornerRadius = false,
+		// The profile's corner radius rounds each key picture and its border.
+		CornerRadius = model.HasKeyImages,
 		CustomFolderViews = false,
 		ScreenSavers = false,
 	};
