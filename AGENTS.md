@@ -49,10 +49,9 @@ Rules specific to this plugin:
 - New third-party packages need the owner's explicit approval. HidSharp 2.6.4 is the only one.
 - `THIRD-PARTY-NOTICES` is generated from the published output; regenerate it after a dependency
   change instead of editing it.
-- Until the Macro Deck SDK with key images is published, build with
-  `-p:MacroDeckSdkVersion=<local version>` against `local-feed/` (see README). Before a Store
-  submission the `local` NuGet source must be gone and the SDK and CLI versions pinned to that
-  release.
+- The Macro Deck SDK is pinned to the first release with host-rendered key images
+  (`MacroDeckSdkVersion` in `Directory.Packages.props`). The CLI version in both workflows and
+  `compatibility.macroDeck` in `manifest.json` follow it; change all of them in one change.
 
 Authoritative upstream documentation, in the
 [Macro Deck 3 repository](https://github.com/Macro-Deck-App/Macro-Deck-3/tree/main/docs/plugin-development):
@@ -88,8 +87,8 @@ A change is not done until all six hold:
    way.
 3. **The Macro Deck SDK is at least `minimumSdkVersion`.** The Macro Deck packages float to the newest
    published version by default, so this usually holds on its own. It stops holding when
-   `MacroDeckSdkVersion` is pinned, or when a build runs against `local-feed/`. A release must never be
-   built against an SDK older than the minimum.
+   `MacroDeckSdkVersion` is pinned. A release must never be built against an SDK older than the
+   minimum.
 4. **Only allowed Macro Deck packages are used.** Every package in the graph whose id starts with
    `MacroDeck.` must match an entry in `allowedMacroDeckPackages`. Anything else under that prefix is
    refused on upload, including packages from another Macro Deck repository that were never published
@@ -342,10 +341,6 @@ wrong, `2` usage error, `3` input unreadable, `4` cancelled - `1` and `3` are de
 it after any change to capability shape, cancellation handling or the manifest, and treat a Required
 check going from pass to fail as a blocking regression. Most checks `SKIP` until the plugin declares
 capabilities.
-
-While the SDK with key images is unpublished, every command above needs
-`-p:MacroDeckSdkVersion=<local version>` (or that name as an environment variable for the CLI), with the
-SDK packed into `local-feed/` - see "Development" in [README.md](README.md).
 
 ## Packing a plugin release
 

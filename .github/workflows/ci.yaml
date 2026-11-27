@@ -33,7 +33,7 @@ jobs:
 
       # Always the MacroDeckSdkVersion from Directory.Packages.props.
       - name: Install the plugin CLI
-        run: dotnet tool install --global MacroDeck.Plugin.Cli --version 3.0.5
+        run: dotnet tool install --global MacroDeck.Plugin.Cli --version 3.1.0-beta.4
 
       - name: Conformance
         run: macrodeck-plugin test --project src/StreamDeckConnector --required-only
@@ -53,7 +53,7 @@ jobs:
 
       # Always the MacroDeckSdkVersion from Directory.Packages.props.
       - name: Install the plugin CLI
-        run: dotnet tool install --global MacroDeck.Plugin.Cli --version 3.0.5
+        run: dotnet tool install --global MacroDeck.Plugin.Cli --version 3.1.0-beta.4
 
       - name: Build the package
         run: macrodeck-plugin build --source src/StreamDeckConnector --output ./artifacts

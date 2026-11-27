@@ -124,20 +124,9 @@ dotnet build StreamDeckConnector.slnx -warnaserror
 dotnet test StreamDeckConnector.slnx
 ```
 
-Until the Macro Deck SDK with key images is published, pack it from a Macro Deck checkout that has it
-into `local-feed/` and pass that version to every command:
-
-```bash
-dotnet pack MacroDeck.slnx -c Release -p:Version=3.1.0-local.1 -o <path-to-this-repo>/local-feed
-```
-
-```bash
-dotnet build StreamDeckConnector.slnx -p:MacroDeckSdkVersion=3.1.0-local.1 -warnaserror
-```
-
-Once it is published, raise `MacroDeckSdkVersion` in `Directory.Packages.props` and the CLI version in
-both workflows to that version in one change, set `compatibility.macroDeck` in `manifest.json` to it,
-and remove the `local` source from `NuGet.config`.
+The Macro Deck SDK is pinned in `Directory.Packages.props` (`MacroDeckSdkVersion`). The CLI version in
+both workflows and `compatibility.macroDeck` in `manifest.json` follow it; change all of them in one
+change.
 
 The code has three parts. `Hid/` is the only place that touches HidSharp. `Devices/` is the USB
 transport: the model catalogue, one protocol per device family, and a device object with one reader

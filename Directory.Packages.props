@@ -5,8 +5,8 @@
         <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
         <CentralPackageFloatingVersionsEnabled>true</CentralPackageFloatingVersionsEnabled>
         <!-- One version for every Macro Deck package. The CLI version in both workflows must equal it.
-             A build against a locally packed SDK passes -p:MacroDeckSdkVersion=<version>, see README.md. -->
-        <MacroDeckSdkVersion Condition="'$(MacroDeckSdkVersion)' == ''">3.0.5</MacroDeckSdkVersion>
+             A prerelease because no stable SDK has host-rendered key images yet. -->
+        <MacroDeckSdkVersion Condition="'$(MacroDeckSdkVersion)' == ''">3.1.0-beta.4</MacroDeckSdkVersion>
     </PropertyGroup>
 
     <ItemGroup>
