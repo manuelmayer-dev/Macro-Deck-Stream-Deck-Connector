@@ -150,7 +150,8 @@ public sealed class LayoutTests
 			Assert.That(visuals.AnimatedIcons && visuals.Borders, Is.True);
 			Assert.That(visuals.ScreenSavers, Is.False);
 			Assert.That(visuals.CustomFolderViews, Is.False);
-			Assert.That(visuals.WidgetSpacing || visuals.CornerRadius, Is.False);
+			Assert.That(visuals.WidgetSpacing, Is.False);
+			Assert.That(visuals.CornerRadius, Is.True);
 		});
 	}
 
